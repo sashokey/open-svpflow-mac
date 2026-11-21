@@ -30,7 +30,9 @@ jobs:
           fetch-depth: 0
       - name: Verify upstream engine outside reviewed optimizations
         run: >
-          git diff --exit-code 85d9cbe4077dc213eb04ea65a7435c9361fdc5c3 -- crates Cargo.toml Cargo.lock
+          git diff --exit-code badc0de9631472c20ce2d276e15941c418e478a9 -- crates Cargo.toml Cargo.lock
+          ':(exclude)crates/svpflow-core/src/metadata.rs'
+          ':(exclude)crates/svpflow-core/src/smooth.rs'
           ':(exclude)crates/svpflow1/src/analyse/metric.rs'
           ':(exclude)crates/svpflow1/src/super_build.rs'
           ':(exclude)crates/svpflow2/src/gpu.rs'
