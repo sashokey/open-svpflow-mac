@@ -123,7 +123,8 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-        if pool.1 + self.len <= budget() / 4 {
+        let limit = (budget() / 4).min(128 << 20);
+        if pool.1 + self.len <= limit {
             pool.1 += self.len;
             pool.0.push(Self {
                 data: self.data,
@@ -317,7 +318,15 @@ struct Entry {
 struct Cache {
     entries: HashMap<(usize, i32), Entry>,
     bytes: usize,
+    frame_max: usize,
     tick: u64,
+}
+
+impl Cache {
+    fn limit(&self) -> usize {
+        // scale cache with frame size so 1080p stays lean while 4k peel fits its 3-chunk window
+        self.frame_max.saturating_mul(80).clamp(256 << 20, budget())
+    }
 }
 
 struct Task {
@@ -337,6 +346,7 @@ struct FrameContext {
     data: Raw,
     requests: Vec<(Arc<Node>, i32)>,
     frames: Vec<((usize, i32), Cell)>,
+    passthrough: bool,
 }
 
 struct Job {
@@ -409,15 +419,14 @@ fn pool() -> &'static Pool {
 
 pub fn set_threads(count: usize) {
     WANT.store(count, Ordering::Relaxed);
-    let running = WORKERS
-        .queue
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .target
-        > 0;
-    if running {
-        WORKERS.resize(threads());
+    // a stop between a check and a resize would wait for workers that came back
+    let mut queue = WORKERS.queue.lock().unwrap_or_else(PoisonError::into_inner);
+    if queue.target > 0 {
+        queue.target = threads();
+        WORKERS.grow(&mut queue);
     }
+    drop(queue);
+    WORKERS.ready.notify_all();
     for plugin in PLUGINS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -507,9 +516,10 @@ impl Pool {
         if queue.target > 0 {
             return;
         }
-        drop(queue);
+        // a spawn after the unlock adds live workers that must not be joined here
         let handles =
             std::mem::take(&mut *self.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        drop(queue);
         for handle in handles {
             let _ = handle.join();
         }
@@ -608,6 +618,7 @@ impl Node {
                 data: std::ptr::null_mut(),
                 requests: Vec::new(),
                 frames: Vec::new(),
+                passthrough: false,
             }),
         });
         if matches!(self.kind, Kind::Source(_)) {
@@ -667,6 +678,27 @@ impl Node {
             return Err(Arc::from(SOURCE_FAILED));
         }
         Ok(Arc::new(frame))
+    }
+
+    fn pass(&self, inputs: &[((usize, i32), Cell)]) -> Produced {
+        let (_, cell) = inputs
+            .first()
+            .ok_or_else(|| Arc::from(c"an input frame is missing"))?;
+        let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let input = match &state.0 {
+            Some(Ok(frame)) => Arc::clone(frame),
+            Some(Err(error)) => return Err(Arc::clone(error)),
+            None => return Err(Arc::from(c"an input frame is missing")),
+        };
+        drop(state);
+        let info = self.info();
+        let mut props = Map::default();
+        props.set(c"_DurationNum", Value::Int(info.fps_den));
+        props.set(c"_DurationDen", Value::Int(info.fps_num));
+        Ok(Arc::new(Frame {
+            planes: UnsafeCell::new(input.planes().to_vec()),
+            props: UnsafeCell::new(props),
+        }))
     }
 
     fn render(&self, mapped: &Mapped, n: i32, inputs: &[((usize, i32), Cell)]) -> Produced {
@@ -766,13 +798,20 @@ impl Task {
             }
             Kind::Mapped(mapped) => {
                 let mut frames = [0; NEEDED];
-                let count = unsafe { (mapped.need)(mapped.user, self.n, frames.as_mut_ptr()) };
-                let count = usize::try_from(count).unwrap_or(0).min(NEEDED);
+                let raw_count = unsafe { (mapped.need)(mapped.user, self.n, frames.as_mut_ptr()) };
+                let passthrough = raw_count < 0;
+                let count = if passthrough {
+                    1
+                } else {
+                    usize::try_from(raw_count).unwrap_or(0).min(NEEDED)
+                };
                 let input = &mapped.input;
                 let requests = frames[..count]
                     .iter()
                     .map(|&n| (Arc::clone(input), input.frame(n)));
-                unsafe { &mut *self.context.get() }.requests = requests.collect();
+                let context = unsafe { &mut *self.context.get() };
+                context.passthrough = passthrough;
+                context.requests = requests.collect();
                 return self.wait();
             }
             Kind::Filter { .. } => {}
@@ -810,9 +849,26 @@ impl Task {
             return;
         }
         if let Kind::Mapped(mapped) = &self.node.kind {
-            let frames = std::mem::take(&mut unsafe { &mut *self.context.get() }.frames);
-            let produced = self.node.render(mapped, self.n, &frames);
+            let context = unsafe { &mut *self.context.get() };
+            let frames = std::mem::take(&mut context.frames);
+            let produced = if context.passthrough {
+                self.node.pass(&frames)
+            } else {
+                self.node.render(mapped, self.n, &frames)
+            };
             return self.complete(produced);
+        }
+        let failed = unsafe { &*self.context.get() }
+            .frames
+            .iter()
+            .find_map(|(_, cell)| {
+                let state = cell.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0.as_ref()?.as_ref().err().map(Arc::clone)
+            });
+        if let Some(error) = failed {
+            self.call(vs3::AR_ERROR);
+            unsafe { &mut *self.context.get() }.frames.clear();
+            return self.complete(Err(error));
         }
         let frame = self.call(vs3::AR_ALL_FRAMES_READY);
         let context = unsafe { &*self.context.get() };
@@ -852,7 +908,9 @@ impl Task {
                         entry.bytes = bytes;
                     }
                     cache.bytes += bytes;
-                    while cache.bytes > budget() {
+                    cache.frame_max = cache.frame_max.max(bytes);
+                    let limit = cache.limit();
+                    while cache.bytes > limit {
                         let oldest = cache
                             .entries
                             .iter()

@@ -12,7 +12,7 @@ mod planes;
 mod pyramid;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use gpu::purge;
+pub(crate) use gpu::{purge, trim};
 pub(crate) use params::{AnalyseParams, SuperParams};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use planes::plane_size;
@@ -86,7 +86,9 @@ pub(crate) fn analyse(
         };
         #[cfg(not(target_arch = "wasm32"))]
         let plan = keys
-            .filter(|_| gpu::refine_gpu().is_some_and(gpu::RefineGpu::chain_ready))
+            .filter(|_| {
+                params.gpu_mode == 1 && gpu::refine_gpu().is_some_and(gpu::RefineGpu::chain_ready)
+            })
             .and_then(|_| chain::ChainPlan::new(params, first, second));
         #[cfg(target_arch = "wasm32")]
         let plan: Option<()> = None;
