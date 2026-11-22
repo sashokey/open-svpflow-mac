@@ -68,7 +68,7 @@ fn memory() -> Option<usize> {
 fn budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET
-        .get_or_init(|| memory().map_or(1 << 30, |memory| (memory / 16).clamp(256 << 20, 1 << 30)))
+        .get_or_init(|| memory().map_or(1 << 30, |memory| (memory / 8).clamp(128 << 20, 4 << 30)))
 }
 
 pub type Read = unsafe extern "C" fn(*mut c_void, i32, *const *mut u8, *const isize) -> i32;
@@ -123,7 +123,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         let mut pool = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-        let limit = (budget() / 4).min(128 << 20);
+        let limit = (budget() / 4).clamp(32 << 20, 512 << 20);
         if pool.1 + self.len <= limit {
             pool.1 += self.len;
             pool.0.push(Self {
@@ -262,11 +262,45 @@ struct Reader {
     ahead: Vec<(i32, Arc<Frame>)>,
 }
 
+struct SourceJob {
+    order: Reverse<(i32, i32, u64)>,
+    task: Arc<Task>,
+}
+
+impl PartialEq for SourceJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for SourceJob {}
+
+impl PartialOrd for SourceJob {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SourceJob {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
+#[derive(Default)]
+struct SourceQueue {
+    running: bool,
+    queued: Option<i32>,
+    count: u64,
+    jobs: BinaryHeap<SourceJob>,
+}
+
 struct Source {
     read: Read,
     release: Option<Release>,
     user: *mut c_void,
     state: Mutex<Reader>,
+    pending: Mutex<SourceQueue>,
 }
 
 struct Mapped {
@@ -324,8 +358,9 @@ struct Cache {
 
 impl Cache {
     fn limit(&self) -> usize {
-        // scale cache with frame size so 1080p stays lean while 4k peel fits its 3-chunk window
-        self.frame_max.saturating_mul(80).clamp(256 << 20, budget())
+        self.frame_max
+            .saturating_mul(160)
+            .clamp(256 << 20, budget())
     }
 }
 
@@ -560,7 +595,7 @@ pub fn busy() -> bool {
         .filter(|entry| Arc::strong_count(&entry.cell) > 1)
         .map(|entry| entry.bytes)
         .sum();
-    used > budget() / 2
+    used > cache.limit() * 3 / 4
 }
 
 pub struct Host {
@@ -621,12 +656,77 @@ impl Node {
                 passthrough: false,
             }),
         });
-        if matches!(self.kind, Kind::Source(_)) {
-            pool().spawn(priority, move || task.begin());
+        if let Kind::Source(source) = &self.kind {
+            let mut pending = source
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.count += 1;
+            let order = Reverse((priority, n, pending.count));
+            pending.jobs.push(SourceJob {
+                order,
+                task: Arc::clone(&task),
+            });
+            let launch = !pending.running && pending.queued.is_none_or(|queued| priority < queued);
+            if launch {
+                pending.queued = Some(priority);
+            }
+            drop(pending);
+            if launch {
+                let node = Arc::clone(self);
+                pool().spawn(priority, move || node.drain_source());
+            }
         } else {
             task.begin();
         }
         cell
+    }
+
+    fn drain_source(self: Arc<Self>) {
+        let Kind::Source(source) = &self.kind else {
+            return;
+        };
+        let mut pending = source
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pending.running {
+            return;
+        }
+        pending.running = true;
+        pending.queued = None;
+        loop {
+            let Some(job) = pending.jobs.pop() else {
+                pending.running = false;
+                return;
+            };
+            drop(pending);
+            let task = job.task;
+            if task.dropped() {
+                pending = source
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let produced = self.read(source, task.n);
+            task.complete(produced);
+            let mut pending = source
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            pending.running = false;
+            let next = pending.jobs.peek().map(|job| job.order.0.0);
+            if let Some(priority) = next {
+                pending.queued = Some(priority);
+            }
+            drop(pending);
+            if let Some(priority) = next {
+                let node = Arc::clone(&self);
+                pool().spawn(priority, move || node.drain_source());
+            }
+            return;
+        }
     }
 
     pub fn get(self: &Arc<Self>, n: i32) -> Produced {
@@ -641,9 +741,11 @@ impl Node {
     }
 
     pub fn window(&self) -> i32 {
+        let workers = threads();
+        let max_ahead = (workers * 3).clamp(24, (READ_AHEAD as usize * 3) / 4);
         let frames = budget() / 4 / self.bytes().max(1);
-        let frames = frames.min(8 * threads()).clamp(8, READ_AHEAD as usize);
-        i32::try_from(frames).unwrap_or(READ_AHEAD)
+        let frames = frames.min(6 * workers).clamp(4, max_ahead);
+        i32::try_from(frames).unwrap_or(24)
     }
 
     fn bytes(&self) -> usize {
@@ -727,7 +829,7 @@ impl Node {
         if let Some(index) = state.ahead.iter().position(|(frame, _)| *frame == n) {
             return Ok(state.ahead.swap_remove(index).1);
         }
-        let reach = self.window() + 16;
+        let reach = (self.window() * 5).clamp(128, 256);
         let first = if n < state.next || n - state.next > reach {
             n
         } else {
@@ -1070,6 +1172,7 @@ impl Host {
                 release,
                 user,
                 state: Mutex::default(),
+                pending: Mutex::default(),
             }),
         })
     }

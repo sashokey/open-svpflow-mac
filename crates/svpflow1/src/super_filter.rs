@@ -24,6 +24,7 @@ unsafe fn create_super_inner(
     core: vs::Raw,
     vsapi: vs::ConstRaw,
 ) -> isize {
+    svpflow_core::threads::set_busy_probe(svpflow_host::context::cpu_busy);
     svpflow_core::threads::set_default(unsafe { vs::core_threads(core, vsapi) });
     let Some(get_node) = (unsafe { vs::table_fn::<vs::PropGetNode>(vsapi, vs::PROP_GET_NODE) })
     else {
@@ -117,7 +118,7 @@ unsafe fn create_super_inner(
     0
 }
 
-unsafe fn read_opt(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<params::Value> {
+pub(crate) unsafe fn read_opt(input: vs::ConstRaw, vsapi: vs::ConstRaw) -> Option<params::Value> {
     let get_data = unsafe { vs::table_fn::<vs::PropGetData>(vsapi, vs::PROP_GET_DATA)? };
     let get_size = unsafe { vs::table_fn::<vs::PropGetDataSize>(vsapi, vs::PROP_GET_DATA_SIZE)? };
     let mut err = 0;
@@ -241,7 +242,9 @@ unsafe extern "system" fn get_frame_super(
         return std::ptr::null();
     }
 
-    for plane in 0..3 {
+    let _busy = svpflow_core::threads::enter_busy();
+    let planes = if state.opts.luma_only() { 1 } else { 3 };
+    for plane in 0..planes {
         let stride = unsafe { get_stride(out.cast_const(), plane) } as usize;
         let ptr = unsafe { get_write(out, plane) };
         let (x_div, y_div) = if plane == 0 {
@@ -275,7 +278,7 @@ unsafe extern "system" fn get_frame_super(
     let src_w = state.opts.width as usize;
     let src_h = state.opts.height as usize;
 
-    for plane in 0..3i32 {
+    for plane in 0..planes {
         let (x_div, y_div) = if plane == 0 {
             (1, 1)
         } else {

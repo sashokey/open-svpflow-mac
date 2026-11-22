@@ -89,7 +89,7 @@ pub(crate) struct FilterState {
     pub(crate) quality_cache: std::sync::Mutex<Vec<(i32, i32, Vec<u8>)>>,
     pub(crate) quality_cells: Cache<(i32, Vec<u8>)>,
     pub(crate) motion_cache: Cache<[Vec<u16>; 8]>,
-    pub(crate) repeat_cache: std::sync::Mutex<Vec<(i32, bool)>>,
+    pub(crate) repeat_cache: std::sync::Mutex<Box<[(i32, bool); 512]>>,
     pub(crate) still_cache: Cache<Vec<u8>>,
     pub(crate) layers: std::sync::Mutex<crate::peel::Layers>,
     pub(crate) image: Option<std::sync::Arc<crate::image::Mask>>,
@@ -152,8 +152,13 @@ impl Pooled for u16 {
 static EXPAND_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
 static WIDE_POOL: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
 const EXPAND_POOL_CAP: usize = 12;
-const EXPAND_POOL_BYTES: usize = 64 << 20;
-const EXPAND_CACHE_BYTES: usize = 128 << 20;
+fn expand_pool_budget() -> usize {
+    (svpflow_host::hardware::total_ram_bytes() / 64).clamp(32 << 20, 256 << 20)
+}
+
+fn expand_cache_budget() -> usize {
+    (svpflow_host::hardware::total_ram_bytes() / 32).clamp(64 << 20, 512 << 20)
+}
 
 fn expand_cache_cap<T>(width: usize, height: usize) -> usize {
     let bytes = width
@@ -161,7 +166,10 @@ fn expand_cache_cap<T>(width: usize, height: usize) -> usize {
         .saturating_mul(6)
         .saturating_mul(size_of::<T>())
         .max(1);
-    (EXPAND_CACHE_BYTES / bytes).clamp(4, EXPAND_CACHE_CAP / size_of::<T>())
+    let max_entries = (EXPAND_CACHE_CAP / size_of::<T>())
+        .max(svpflow_core::threads::workers().saturating_mul(2))
+        .min(64);
+    (expand_cache_budget() / bytes).clamp(4, max_entries)
 }
 
 pub(crate) fn clear_expand_pool() {
@@ -194,9 +202,10 @@ impl<T: Pooled> Drop for SuperExpand<T> {
                 .iter()
                 .map(|buf| buf.capacity().saturating_mul(size_of::<T>()))
                 .sum();
+            let pool_budget = expand_pool_budget();
             for buffer in [&mut self.y, &mut self.u, &mut self.v] {
                 let add = buffer.capacity().saturating_mul(size_of::<T>());
-                if pool.len() < EXPAND_POOL_CAP && bytes.saturating_add(add) <= EXPAND_POOL_BYTES {
+                if pool.len() < EXPAND_POOL_CAP && bytes.saturating_add(add) <= pool_budget {
                     bytes += add;
                     pool.push(std::mem::take(buffer));
                 }
@@ -517,12 +526,18 @@ impl FilterState {
                         let api = unsafe { frame::PlaneApi::load(vsapi) };
                         api.and_then(|api| {
                             let (width, height) = nvof.dimensions();
-                            let current =
-                                unsafe { pack_nv12_frame(&api, source_8bit, width, height) }?;
-                            let next =
-                                unsafe { pack_nv12_frame(&api, next_source_8bit, width, height) }?;
-                            nvof.generate(source_frame, &current, &next, vector_data)
-                                .ok()
+                            let down = nvof.downscale();
+                            nvof.generate_lazy(
+                                source_frame,
+                                || unsafe {
+                                    pack_nv12_frame(&api, source_8bit, width, height, down)
+                                },
+                                || unsafe {
+                                    pack_nv12_frame(&api, next_source_8bit, width, height, down)
+                                },
+                                vector_data,
+                            )
+                            .ok()
                         })
                     };
                     if let Some(payload) = payload
@@ -1749,7 +1764,9 @@ impl FilterState {
                 phase,
             );
         }
-        let lean_pel = metadata::super_data(self.sdata).lean() && !vector_data.marker_is_one();
+        let super_data = metadata::super_data(self.sdata);
+        let lean_pel =
+            (super_data.lean() || super_data.luma_only()) && !vector_data.marker_is_one();
         let source_step = if lean_pel || super0.is_some() || super1.is_some() {
             metadata::super_data(self.sdata).scale().max(1)
         } else {
@@ -3480,9 +3497,26 @@ pub(crate) unsafe fn pack_nv12_frame(
     frame: vs::ConstRaw,
     width: usize,
     height: usize,
+    downscale: i32,
 ) -> Option<Vec<u8>> {
     if frame.is_null() {
         return None;
+    }
+    if downscale >= 2 {
+        let src_h = height.saturating_mul(2);
+        let src_ch = height;
+        let (y, y_stride, y_len) = unsafe { api.read_plane(frame, 0, src_h) }?;
+        let (u, uv_stride, u_len) = unsafe { api.read_plane(frame, 1, src_ch) }?;
+        let (v, _, v_len) = unsafe { api.read_plane(frame, 2, src_ch) }?;
+        return Some(metadata::pack_nv12_half(
+            unsafe { slice::from_raw_parts(y, y_len) },
+            unsafe { slice::from_raw_parts(u, u_len) },
+            unsafe { slice::from_raw_parts(v, v_len) },
+            width,
+            height,
+            y_stride,
+            uv_stride,
+        ));
     }
     let chroma_height = height / 2;
     let (y, y_stride, y_len) = unsafe { api.read_plane(frame, 0, height) }?;
@@ -3655,6 +3689,7 @@ fn gpu_render_frame(
         None,
         None,
         None,
+        (0, false),
     )
     .is_some()
 }
@@ -3672,7 +3707,8 @@ pub(crate) unsafe fn super_frame_planes(
     super_info: Option<&vs::VideoInfo>,
     sdata: i64,
 ) -> Option<renderer::FramePlanes<'static>> {
-    if !metadata::super_data(sdata).full() || metadata::super_data(sdata).lean() {
+    let super_data = metadata::super_data(sdata);
+    if !super_data.full() || super_data.lean() || super_data.luma_only() {
         return None;
     }
     let lane = usize::try_from(metadata::super_data(sdata).scale()).ok()?;

@@ -1,4 +1,4 @@
-Native Apple Silicon interpolation plugins with a SwiftUI launcher and settings interface for external mpv. Requires macOS 26 or later and compatible Homebrew playback components. Based on [open-svpflow 0.1.3](https://github.com/Z1xus/open-svpflow/tree/badc0de2282d2300303f5b9461919a2bc4dbcf65); the engine retains the signed motion-vector decoding fix and is otherwise unchanged.
+Native Apple Silicon interpolation plugins with a SwiftUI launcher and settings interface for external mpv. Requires macOS 26 or later and compatible Homebrew playback components. Based on [open-svpflow 0.1.4](https://github.com/Z1xus/open-svpflow/tree/badc0de73b274d73bb8dad4affece877261338ce) with a fix for signed motion-vector decoding and targeted Apple Silicon optimizations.
 
 ![Open SVPflow main window](assets/OpenSVPflow-screenshot.png)
 

@@ -100,7 +100,8 @@ pub(crate) fn clear_margins(
 ) {
     let cubic = ReduceFilter::from_option(opts.scale_down) == Some(ReduceFilter::Cubic);
     for (level, region) in regions.iter().enumerate().skip(1) {
-        let fused = cubic
+        let fused = !opts.fast_box()
+            && cubic
             && (level > 1 || opts.full)
             && cubic_fits(regions[level - 1].offset, pitch, *region, frame_len);
         if fused {
@@ -133,39 +134,72 @@ pub(crate) fn build_plane(
         frame: dst,
         spill: Vec::new(),
     };
-    let filter = ReduceFilter::from_option(opts.scale_down);
-    let fused = opts.full
-        && filter == Some(ReduceFilter::Cubic)
-        && regions.len() > 1
-        && reduce_cubic(
-            canvas.frame,
-            level0.offset,
-            pitch,
-            regions[1],
-            Some(&Level0 {
-                src,
-                src_pitch,
-                width: level0.width,
-                height: level0.height,
-            }),
-        );
-    if opts.full && !fused {
-        for row in 0..level0.height {
-            canvas.store(
-                level0.offset + row * pitch,
-                &src[row * src_pitch..][..level0.width],
+    if opts.fast_box() {
+        let fused = opts.full
+            && regions.len() > 1
+            && reduce_box_fast_level0(
+                canvas.frame,
+                level0.offset,
+                pitch,
+                regions[1],
+                &Level0 {
+                    src,
+                    src_pitch,
+                    width: level0.width,
+                    height: level0.height,
+                },
             );
+        if opts.full && !fused {
+            for row in 0..level0.height {
+                canvas.store(
+                    level0.offset + row * pitch,
+                    &src[row * src_pitch..][..level0.width],
+                );
+            }
         }
-    }
-    if let Some(filter) = filter {
         for (level, pair) in regions.windows(2).enumerate().skip(usize::from(fused)) {
             let source = if level == 0 && !opts.full {
                 Source::Separate(src, src_pitch)
             } else {
                 Source::Within(pair[0].offset, pitch)
             };
-            let compact = matches!(source, Source::Separate(..));
-            reduce(filter, source, &mut canvas, pair[1], pitch, compact);
+            reduce_box_fast(source, &mut canvas, pair[1], pitch);
+        }
+    } else {
+        let filter = ReduceFilter::from_option(opts.scale_down);
+        let fused = opts.full
+            && filter == Some(ReduceFilter::Cubic)
+            && regions.len() > 1
+            && reduce_cubic(
+                canvas.frame,
+                level0.offset,
+                pitch,
+                regions[1],
+                Some(&Level0 {
+                    src,
+                    src_pitch,
+                    width: level0.width,
+                    height: level0.height,
+                }),
+            );
+        if opts.full && !fused {
+            for row in 0..level0.height {
+                canvas.store(
+                    level0.offset + row * pitch,
+                    &src[row * src_pitch..][..level0.width],
+                );
+            }
+        }
+        if let Some(filter) = filter {
+            for (level, pair) in regions.windows(2).enumerate().skip(usize::from(fused)) {
+                let source = if level == 0 && !opts.full {
+                    Source::Separate(src, src_pitch)
+                } else {
+                    Source::Within(pair[0].offset, pitch)
+                };
+                let compact = matches!(source, Source::Separate(..));
+                reduce(filter, source, &mut canvas, pair[1], pitch, compact);
+            }
         }
     }
     if opts.pel > 1 && opts.gpu < 2 && opts.full {
@@ -174,7 +208,14 @@ pub(crate) fn build_plane(
             1 => Upscale::Bicubic,
             _ => Upscale::Wiener,
         };
-        refine(&mut canvas, level0, pitch, opts.pel as usize, upscale);
+        refine(
+            &mut canvas,
+            level0,
+            pitch,
+            opts.pel as usize,
+            upscale,
+            opts.fast() >= 1,
+        );
     }
 }
 
@@ -649,8 +690,341 @@ mod cubic_neon {
 }
 
 fn vertical_average(out: &mut [u8], a: &[u8], b: &[u8]) {
-    for ((value, &a), &b) in out.iter_mut().zip(a).zip(b) {
-        *value = ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
+    avg_u8_slice(out, a, b);
+}
+
+#[inline]
+fn avg_u8(a: u8, b: u8) -> u8 {
+    ((u16::from(a) + u16::from(b) + 1) >> 1) as u8
+}
+
+fn avg_u8_slice(out: &mut [u8], a: &[u8], b: &[u8]) {
+    let n = out.len().min(a.len()).min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { avg_u8_avx512(&mut out[..n], &a[..n], &b[..n]) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { avg_u8_avx2(&mut out[..n], &a[..n], &b[..n]) }
+    } else {
+        unsafe { avg_u8_sse2(&mut out[..n], &a[..n], &b[..n]) }
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { avg_u8_neon(&mut out[..n], &a[..n], &b[..n]) };
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    let done = unsafe { avg_u8_wasm(&mut out[..n], &a[..n], &b[..n]) };
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    let done = 0usize;
+    for i in done..n {
+        out[i] = avg_u8(a[i], b[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn avg_u8_avx512(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::x86_64::{_mm512_avg_epu8, _mm512_loadu_si512, _mm512_storeu_si512};
+    let n = out.len();
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let va = _mm512_loadu_si512(a.as_ptr().add(i).cast());
+            let vb = _mm512_loadu_si512(b.as_ptr().add(i).cast());
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), _mm512_avg_epu8(va, vb));
+        }
+        i += 64;
+    }
+    i + unsafe { avg_u8_avx2(&mut out[i..], &a[i..], &b[i..]) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avg_u8_avx2(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::x86_64::{_mm256_avg_epu8, _mm256_loadu_si256, _mm256_storeu_si256};
+    let n = out.len();
+    let mut i = 0;
+    while i + 32 <= n {
+        unsafe {
+            let va = _mm256_loadu_si256(a.as_ptr().add(i).cast());
+            let vb = _mm256_loadu_si256(b.as_ptr().add(i).cast());
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), _mm256_avg_epu8(va, vb));
+        }
+        i += 32;
+    }
+    i + unsafe { avg_u8_sse2(&mut out[i..], &a[i..], &b[i..]) }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn avg_u8_sse2(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::x86_64::{_mm_avg_epu8, _mm_loadu_si128, _mm_storeu_si128};
+    let n = out.len();
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let va = _mm_loadu_si128(a.as_ptr().add(i).cast());
+            let vb = _mm_loadu_si128(b.as_ptr().add(i).cast());
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), _mm_avg_epu8(va, vb));
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn avg_u8_neon(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::aarch64::{vld1q_u8, vrhaddq_u8, vst1q_u8};
+    let n = out.len();
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let va = vld1q_u8(a.as_ptr().add(i));
+            let vb = vld1q_u8(b.as_ptr().add(i));
+            vst1q_u8(out.as_mut_ptr().add(i), vrhaddq_u8(va, vb));
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn avg_u8_wasm(out: &mut [u8], a: &[u8], b: &[u8]) -> usize {
+    use std::arch::wasm32::{u8x16_avgr, v128, v128_load, v128_store};
+    let n = out.len();
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let va = v128_load(a.as_ptr().add(i).cast::<v128>());
+            let vb = v128_load(b.as_ptr().add(i).cast::<v128>());
+            v128_store(out.as_mut_ptr().add(i).cast::<v128>(), u8x16_avgr(va, vb));
+        }
+        i += 16;
+    }
+    i
+}
+
+fn box_reduce_row(out: &mut [u8], row0: &[u8], row1: &[u8]) {
+    let w = out.len();
+    if w == 0 || row0.len() < 2 * w || row1.len() < 2 * w {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx2") {
+        unsafe { box_reduce_row_avx2(out, row0, row1) }
+    } else {
+        unsafe { box_reduce_row_sse2(out, row0, row1) }
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { box_reduce_row_neon(out, row0, row1) };
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    let done = unsafe { box_reduce_row_wasm(out, row0, row1) };
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
+    let done = 0usize;
+    for x in done..w {
+        let v0 = avg_u8(row0[2 * x], row1[2 * x]);
+        let v1 = avg_u8(row0[2 * x + 1], row1[2 * x + 1]);
+        out[x] = avg_u8(v0, v1);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn box_reduce_row_avx2(out: &mut [u8], row0: &[u8], row1: &[u8]) -> usize {
+    use std::arch::x86_64::{
+        _mm256_and_si256, _mm256_avg_epu8, _mm256_loadu_si256, _mm256_packus_epi16,
+        _mm256_permute4x64_epi64, _mm256_set1_epi16, _mm256_srli_epi16, _mm256_storeu_si256,
+    };
+    let w = out.len();
+    let mask = _mm256_set1_epi16(0x00ff);
+    let mut x = 0;
+    while x + 32 <= w {
+        let sx = 2 * x;
+        unsafe {
+            let v0 = _mm256_avg_epu8(
+                _mm256_loadu_si256(row0.as_ptr().add(sx).cast()),
+                _mm256_loadu_si256(row1.as_ptr().add(sx).cast()),
+            );
+            let v1 = _mm256_avg_epu8(
+                _mm256_loadu_si256(row0.as_ptr().add(sx + 32).cast()),
+                _mm256_loadu_si256(row1.as_ptr().add(sx + 32).cast()),
+            );
+            let even = _mm256_packus_epi16(_mm256_and_si256(v0, mask), _mm256_and_si256(v1, mask));
+            let odd = _mm256_packus_epi16(_mm256_srli_epi16::<8>(v0), _mm256_srli_epi16::<8>(v1));
+            let avg = _mm256_permute4x64_epi64::<0xd8>(_mm256_avg_epu8(even, odd));
+            _mm256_storeu_si256(out.as_mut_ptr().add(x).cast(), avg);
+        }
+        x += 32;
+    }
+    x + unsafe { box_reduce_row_sse2(&mut out[x..], &row0[2 * x..], &row1[2 * x..]) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn box_reduce_row_sse2(out: &mut [u8], row0: &[u8], row1: &[u8]) -> usize {
+    use std::arch::x86_64::{
+        _mm_and_si128, _mm_avg_epu8, _mm_loadu_si128, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_srli_epi16, _mm_storeu_si128,
+    };
+    let w = out.len();
+    let mask = _mm_set1_epi16(0x00ff);
+    let mut x = 0;
+    while x + 16 <= w {
+        let sx = 2 * x;
+        unsafe {
+            let v0 = _mm_avg_epu8(
+                _mm_loadu_si128(row0.as_ptr().add(sx).cast()),
+                _mm_loadu_si128(row1.as_ptr().add(sx).cast()),
+            );
+            let v1 = _mm_avg_epu8(
+                _mm_loadu_si128(row0.as_ptr().add(sx + 16).cast()),
+                _mm_loadu_si128(row1.as_ptr().add(sx + 16).cast()),
+            );
+            let even = _mm_packus_epi16(_mm_and_si128(v0, mask), _mm_and_si128(v1, mask));
+            let odd = _mm_packus_epi16(_mm_srli_epi16::<8>(v0), _mm_srli_epi16::<8>(v1));
+            _mm_storeu_si128(out.as_mut_ptr().add(x).cast(), _mm_avg_epu8(even, odd));
+        }
+        x += 16;
+    }
+    x
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn box_reduce_row_neon(out: &mut [u8], row0: &[u8], row1: &[u8]) -> usize {
+    use std::arch::aarch64::{vld1q_u8, vrhaddq_u8, vst1q_u8, vuzp1q_u8, vuzp2q_u8};
+    let w = out.len();
+    let mut x = 0;
+    while x + 16 <= w {
+        let sx = 2 * x;
+        unsafe {
+            let v0 = vrhaddq_u8(
+                vld1q_u8(row0.as_ptr().add(sx)),
+                vld1q_u8(row1.as_ptr().add(sx)),
+            );
+            let v1 = vrhaddq_u8(
+                vld1q_u8(row0.as_ptr().add(sx + 16)),
+                vld1q_u8(row1.as_ptr().add(sx + 16)),
+            );
+            let even = vuzp1q_u8(v0, v1);
+            let odd = vuzp2q_u8(v0, v1);
+            vst1q_u8(out.as_mut_ptr().add(x), vrhaddq_u8(even, odd));
+        }
+        x += 16;
+    }
+    x
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+unsafe fn box_reduce_row_wasm(out: &mut [u8], row0: &[u8], row1: &[u8]) -> usize {
+    use std::arch::wasm32::{i8x16_shuffle, u8x16_avgr, v128, v128_load, v128_store};
+    let w = out.len();
+    let mut x = 0;
+    while x + 16 <= w {
+        let sx = 2 * x;
+        unsafe {
+            let v0 = u8x16_avgr(
+                v128_load(row0.as_ptr().add(sx).cast::<v128>()),
+                v128_load(row1.as_ptr().add(sx).cast::<v128>()),
+            );
+            let v1 = u8x16_avgr(
+                v128_load(row0.as_ptr().add(sx + 16).cast::<v128>()),
+                v128_load(row1.as_ptr().add(sx + 16).cast::<v128>()),
+            );
+            let even = i8x16_shuffle::<0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30>(
+                v0, v1,
+            );
+            let odd = i8x16_shuffle::<1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31>(
+                v0, v1,
+            );
+            v128_store(
+                out.as_mut_ptr().add(x).cast::<v128>(),
+                u8x16_avgr(even, odd),
+            );
+        }
+        x += 16;
+    }
+    x
+}
+
+fn reduce_box_fast_level0(
+    frame: &mut [u8],
+    base: usize,
+    pitch: usize,
+    target: Region,
+    level0: &Level0<'_>,
+) -> bool {
+    let (width, height) = (target.width, target.height);
+    let width2 = 2 * width;
+    if width == 0
+        || height == 0
+        || width2 > level0.width
+        || 2 * height > level0.height
+        || base + (level0.height - 1) * pitch + level0.width > target.offset
+        || target.offset + (height - 1) * pitch + width > frame.len()
+    {
+        return false;
+    }
+    let (head, tail) = frame.split_at_mut(target.offset);
+    for y in 0..height {
+        let r0 = &level0.src[(2 * y) * level0.src_pitch..][..level0.width];
+        let r1 = &level0.src[(2 * y + 1) * level0.src_pitch..][..level0.width];
+        head[base + (2 * y) * pitch..][..level0.width].copy_from_slice(r0);
+        head[base + (2 * y + 1) * pitch..][..level0.width].copy_from_slice(r1);
+        box_reduce_row(&mut tail[y * pitch..][..width], &r0[..width2], &r1[..width2]);
+    }
+    for r in 2 * height..level0.height {
+        head[base + r * pitch..][..level0.width]
+            .copy_from_slice(&level0.src[r * level0.src_pitch..][..level0.width]);
+    }
+    true
+}
+
+fn reduce_box_fast(source: Source<'_>, canvas: &mut Canvas<'_>, target: Region, pitch: usize) {
+    let (width, height) = (target.width, target.height);
+    let width2 = 2 * width;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if let Source::Within(base, src_pitch) = source
+        && base + (2 * height - 1) * src_pitch + width2 <= target.offset
+        && target.offset + (height - 1) * pitch + width <= canvas.frame.len()
+    {
+        let (head, tail) = canvas.frame.split_at_mut(target.offset);
+        for y in 0..height {
+            let r0 = &head[base + (2 * y) * src_pitch..][..width2];
+            let r1 = &head[base + (2 * y + 1) * src_pitch..][..width2];
+            box_reduce_row(&mut tail[y * pitch..][..width], r0, r1);
+        }
+        return;
+    }
+    if let Source::Separate(src, src_pitch) = source
+        && (2 * height - 1) * src_pitch + width2 <= src.len()
+        && target.offset + (height - 1) * pitch + width <= canvas.frame.len()
+    {
+        for y in 0..height {
+            let r0 = &src[(2 * y) * src_pitch..][..width2];
+            let r1 = &src[(2 * y + 1) * src_pitch..][..width2];
+            box_reduce_row(&mut canvas.frame[target.offset + y * pitch..][..width], r0, r1);
+        }
+        return;
+    }
+    let src_pitch = match source {
+        Source::Separate(_, p) | Source::Within(_, p) => p as isize,
+    };
+    let mut s0 = Vec::new();
+    let mut s1 = Vec::new();
+    let mut out = vec![0u8; width];
+    for y in 0..height {
+        let center = (2 * y) as isize * src_pitch;
+        let r0 = canvas.view(source, center, width2, &mut s0);
+        let r1 = canvas.view(source, center + src_pitch, width2, &mut s1);
+        box_reduce_row(&mut out, r0, r1);
+        canvas.store(target.offset + y * pitch, &out);
     }
 }
 
@@ -665,34 +1039,566 @@ fn vertical_filter(filter: ReduceFilter, out: &mut [u8], rows: [&[u8]; 6]) {
         }
     };
     let (m2, m1, c0, p1, p2, p3) = (row(-2), row(-1), row(0), row(1), row(2), row(3));
-    macro_rules! run {
-        ($f:expr) => {
-            for x in 0..n {
-                let t = |r: &[u8]| u16::from(r[x]);
-                out[x] = ($f)(t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)) as u8;
-            }
-        };
-    }
     match filter {
         ReduceFilter::Average => {
-            run!(|_, m1: u16, c0: u16, p1: u16, _, _| (m1 + 2 * c0 + p1 + 2) >> 2)
+            fir4_u8::<1, 2, 1, 0, 2, 2>(out, [m1, c0, p1, p1]);
         }
         ReduceFilter::Bilinear => {
-            run!(|_, m1: u16, c0: u16, p1: u16, p2: u16, _| (m1 + 3 * (c0 + p1) + p2 + 4) >> 3);
+            fir4_u8::<1, 3, 3, 1, 4, 3>(out, [m1, c0, p1, p2]);
         }
-        ReduceFilter::Quadratic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
-            + 9 * (m1 + p2)
-            + 22 * (c0 + p1)
-            + p3
-            + 32)
-            >> 6),
-        ReduceFilter::Cubic => run!(|m2: u16, m1: u16, c0: u16, p1: u16, p2: u16, p3: u16| (m2
-            + 5 * (m1 + p2)
-            + 10 * (c0 + p1)
-            + p3
-            + 16)
-            >> 5),
+        ReduceFilter::Quadratic => {
+            fir6_u8::<1, 9, 22, 22, 9, 1, 32, 6>(out, [m2, m1, c0, p1, p2, p3]);
+        }
+        ReduceFilter::Cubic => {
+            fir6_u8::<1, 5, 10, 10, 5, 1, 16, 5>(out, [m2, m1, c0, p1, p2, p3]);
+        }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn pair_weight(a: i8, b: i8) -> i16 {
+    i16::from_le_bytes([a as u8, b as u8])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+fn srai_epi16_avx512<const SHIFT: i32>(
+    v: std::arch::x86_64::__m512i,
+) -> std::arch::x86_64::__m512i {
+    use std::arch::x86_64::_mm512_srai_epi16;
+    match SHIFT {
+        2 => _mm512_srai_epi16::<2>(v),
+        3 => _mm512_srai_epi16::<3>(v),
+        4 => _mm512_srai_epi16::<4>(v),
+        5 => _mm512_srai_epi16::<5>(v),
+        _ => _mm512_srai_epi16::<6>(v),
+    }
+}
+
+fn fir4_u8<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) {
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { fir4_avx512::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { fir4_avx2::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("ssse3") {
+        unsafe { fir4_ssse3::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { fir4_neon::<W0, W1, W2, W3, BIAS, SHIFT>(out, taps) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    let [t0, t1, t2, t3] = taps;
+    for i in done..n {
+        let sum = i32::from(W0) * i32::from(t0[i])
+            + i32::from(W1) * i32::from(t1[i])
+            + i32::from(W2) * i32::from(t2[i])
+            + i32::from(W3) * i32::from(t3[i])
+            + i32::from(BIAS);
+        out[i] = (sum >> SHIFT).clamp(0, 255) as u8;
+    }
+}
+
+fn fir6_u8<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) {
+    let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    let done = if std::is_x86_feature_detected!("avx512bw") {
+        unsafe { fir6_avx512::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { fir6_avx2::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else if std::is_x86_feature_detected!("ssse3") {
+        unsafe { fir6_ssse3::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) }
+    } else {
+        0
+    };
+    #[cfg(target_arch = "aarch64")]
+    let done = unsafe { fir6_neon::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(out, taps) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = 0usize;
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    for i in done..n {
+        let sum = i32::from(W0) * i32::from(t0[i])
+            + i32::from(W1) * i32::from(t1[i])
+            + i32::from(W2) * i32::from(t2[i])
+            + i32::from(W3) * i32::from(t3[i])
+            + i32::from(W4) * i32::from(t4[i])
+            + i32::from(W5) * i32::from(t5[i])
+            + i32::from(BIAS);
+        out[i] = (sum >> SHIFT).clamp(0, 255) as u8;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn fir4_avx512<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm512_add_epi16, _mm512_loadu_si512, _mm512_maddubs_epi16, _mm512_packus_epi16,
+        _mm512_set1_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi8, _mm512_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm512_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm512_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm512_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let v0 = _mm512_loadu_si512(t0.as_ptr().add(i).cast());
+            let v1 = _mm512_loadu_si512(t1.as_ptr().add(i).cast());
+            let v2 = _mm512_loadu_si512(t2.as_ptr().add(i).cast());
+            let v3 = _mm512_loadu_si512(t3.as_ptr().add(i).cast());
+            let lo = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed = _mm512_packus_epi16(
+                srai_epi16_avx512::<SHIFT>(lo),
+                srai_epi16_avx512::<SHIFT>(hi),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 64;
+    }
+    i + unsafe {
+        fir4_avx2::<W0, W1, W2, W3, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fir4_avx2<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_set1_epi16, _mm256_srai_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm256_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm256_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm256_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 32 <= n {
+        unsafe {
+            let v0 = _mm256_loadu_si256(t0.as_ptr().add(i).cast());
+            let v1 = _mm256_loadu_si256(t1.as_ptr().add(i).cast());
+            let v2 = _mm256_loadu_si256(t2.as_ptr().add(i).cast());
+            let v3 = _mm256_loadu_si256(t3.as_ptr().add(i).cast());
+            let lo = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed = _mm256_packus_epi16(
+                _mm256_srai_epi16::<SHIFT>(lo),
+                _mm256_srai_epi16::<SHIFT>(hi),
+            );
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 32;
+    }
+    i + unsafe {
+        fir4_ssse3::<W0, W1, W2, W3, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn fir4_ssse3<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_loadu_si128, _mm_maddubs_epi16, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_srai_epi16, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let wa = _mm_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm_set1_epi16(pair_weight(W2, W3));
+    let bias = _mm_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let v0 = _mm_loadu_si128(t0.as_ptr().add(i).cast());
+            let v1 = _mm_loadu_si128(t1.as_ptr().add(i).cast());
+            let v2 = _mm_loadu_si128(t2.as_ptr().add(i).cast());
+            let v3 = _mm_loadu_si128(t3.as_ptr().add(i).cast());
+            let lo = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let hi = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v2, v3), wb),
+                ),
+                bias,
+            );
+            let packed =
+                _mm_packus_epi16(_mm_srai_epi16::<SHIFT>(lo), _mm_srai_epi16::<SHIFT>(hi));
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn fir6_avx512<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm512_add_epi16, _mm512_loadu_si512, _mm512_maddubs_epi16, _mm512_packus_epi16,
+        _mm512_set1_epi16, _mm512_storeu_si512, _mm512_unpackhi_epi8, _mm512_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm512_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm512_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm512_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm512_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 64 <= n {
+        unsafe {
+            let v0 = _mm512_loadu_si512(t0.as_ptr().add(i).cast());
+            let v1 = _mm512_loadu_si512(t1.as_ptr().add(i).cast());
+            let v2 = _mm512_loadu_si512(t2.as_ptr().add(i).cast());
+            let v3 = _mm512_loadu_si512(t3.as_ptr().add(i).cast());
+            let v4 = _mm512_loadu_si512(t4.as_ptr().add(i).cast());
+            let v5 = _mm512_loadu_si512(t5.as_ptr().add(i).cast());
+            let lo = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm512_add_epi16(
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v0, v1), wa),
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm512_add_epi16(
+                    _mm512_maddubs_epi16(_mm512_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed = _mm512_packus_epi16(
+                srai_epi16_avx512::<SHIFT>(lo),
+                srai_epi16_avx512::<SHIFT>(hi),
+            );
+            _mm512_storeu_si512(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 64;
+    }
+    i + unsafe {
+        fir6_avx2::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fir6_avx2<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm256_add_epi16, _mm256_loadu_si256, _mm256_maddubs_epi16, _mm256_packus_epi16,
+        _mm256_set1_epi16, _mm256_srai_epi16, _mm256_storeu_si256, _mm256_unpackhi_epi8,
+        _mm256_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm256_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm256_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm256_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm256_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 32 <= n {
+        unsafe {
+            let v0 = _mm256_loadu_si256(t0.as_ptr().add(i).cast());
+            let v1 = _mm256_loadu_si256(t1.as_ptr().add(i).cast());
+            let v2 = _mm256_loadu_si256(t2.as_ptr().add(i).cast());
+            let v3 = _mm256_loadu_si256(t3.as_ptr().add(i).cast());
+            let v4 = _mm256_loadu_si256(t4.as_ptr().add(i).cast());
+            let v5 = _mm256_loadu_si256(t5.as_ptr().add(i).cast());
+            let lo = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm256_add_epi16(
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v0, v1), wa),
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(_mm256_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed = _mm256_packus_epi16(
+                _mm256_srai_epi16::<SHIFT>(lo),
+                _mm256_srai_epi16::<SHIFT>(hi),
+            );
+            _mm256_storeu_si256(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 32;
+    }
+    i + unsafe {
+        fir6_ssse3::<W0, W1, W2, W3, W4, W5, BIAS, SHIFT>(&mut out[i..], taps.map(|t| &t[i..]))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn fir6_ssse3<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_loadu_si128, _mm_maddubs_epi16, _mm_packus_epi16, _mm_set1_epi16,
+        _mm_srai_epi16, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let wa = _mm_set1_epi16(pair_weight(W0, W1));
+    let wb = _mm_set1_epi16(pair_weight(W2, W3));
+    let wc = _mm_set1_epi16(pair_weight(W4, W5));
+    let bias = _mm_set1_epi16(BIAS);
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let v0 = _mm_loadu_si128(t0.as_ptr().add(i).cast());
+            let v1 = _mm_loadu_si128(t1.as_ptr().add(i).cast());
+            let v2 = _mm_loadu_si128(t2.as_ptr().add(i).cast());
+            let v3 = _mm_loadu_si128(t3.as_ptr().add(i).cast());
+            let v4 = _mm_loadu_si128(t4.as_ptr().add(i).cast());
+            let v5 = _mm_loadu_si128(t5.as_ptr().add(i).cast());
+            let lo = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v2, v3), wb),
+                ),
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpacklo_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let hi = _mm_add_epi16(
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v0, v1), wa),
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v2, v3), wb),
+                ),
+                _mm_add_epi16(
+                    _mm_maddubs_epi16(_mm_unpackhi_epi8(v4, v5), wc),
+                    bias,
+                ),
+            );
+            let packed =
+                _mm_packus_epi16(_mm_srai_epi16::<SHIFT>(lo), _mm_srai_epi16::<SHIFT>(hi));
+            _mm_storeu_si128(out.as_mut_ptr().add(i).cast(), packed);
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fir4_neon<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 4],
+) -> usize {
+    use std::arch::aarch64::{
+        vcombine_u8, vdupq_n_s16, vld1_u8, vmlaq_n_s16, vmovl_u8, vqmovun_s16,
+        vreinterpretq_s16_u16, vshrq_n_s16, vst1q_u8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3] = taps;
+    let bias = unsafe { vdupq_n_s16(BIAS) };
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let eval = |off: usize| {
+                let mut acc = bias;
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t0.as_ptr().add(off)))), i16::from(W0));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t1.as_ptr().add(off)))), i16::from(W1));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t2.as_ptr().add(off)))), i16::from(W2));
+                if W3 != 0 {
+                    acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t3.as_ptr().add(off)))), i16::from(W3));
+                }
+                vqmovun_s16(vshrq_n_s16::<SHIFT>(acc))
+            };
+            let lo = eval(i);
+            let hi = eval(i + 8);
+            vst1q_u8(out.as_mut_ptr().add(i), vcombine_u8(lo, hi));
+        }
+        i += 16;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn fir6_neon<
+    const W0: i8,
+    const W1: i8,
+    const W2: i8,
+    const W3: i8,
+    const W4: i8,
+    const W5: i8,
+    const BIAS: i16,
+    const SHIFT: i32,
+>(
+    out: &mut [u8],
+    taps: [&[u8]; 6],
+) -> usize {
+    use std::arch::aarch64::{
+        vcombine_u8, vdupq_n_s16, vld1_u8, vmlaq_n_s16, vmovl_u8, vqmovun_s16,
+        vreinterpretq_s16_u16, vshrq_n_s16, vst1q_u8,
+    };
+    let n = out.len();
+    let [t0, t1, t2, t3, t4, t5] = taps;
+    let bias = unsafe { vdupq_n_s16(BIAS) };
+    let mut i = 0;
+    while i + 16 <= n {
+        unsafe {
+            let eval = |off: usize| {
+                let mut acc = bias;
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t0.as_ptr().add(off)))), i16::from(W0));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t1.as_ptr().add(off)))), i16::from(W1));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t2.as_ptr().add(off)))), i16::from(W2));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t3.as_ptr().add(off)))), i16::from(W3));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t4.as_ptr().add(off)))), i16::from(W4));
+                acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t5.as_ptr().add(off)))), i16::from(W5));
+                vqmovun_s16(vshrq_n_s16::<SHIFT>(acc))
+            };
+            let lo = eval(i);
+            let hi = eval(i + 8);
+            vst1q_u8(out.as_mut_ptr().add(i), vcombine_u8(lo, hi));
+        }
+        i += 16;
+    }
+    i
 }
 
 #[derive(Default)]
@@ -780,7 +1686,6 @@ fn refine_bilinear2(canvas: &mut Canvas<'_>, level0: Region, pitch: usize) -> bo
     let (vp, rest) = rest.split_at_mut(plane);
     let dp = &mut rest[..plane];
     let n = plane - width - 1;
-    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8;
     {
         let (cur, right, below, diag) = (
             &p0[..n],
@@ -788,28 +1693,68 @@ fn refine_bilinear2(canvas: &mut Canvas<'_>, level0: Region, pitch: usize) -> bo
             &p0[width..width + n],
             &p0[width + 1..=width + n],
         );
-        let (hp, vp, dp) = (&mut hp[..n], &mut vp[..n], &mut dp[..n]);
-        for i in 0..n {
-            hp[i] = mean(cur[i], right[i]);
-            vp[i] = mean(cur[i], below[i]);
-            dp[i] = mean(cur[i], diag[i]);
-        }
+        avg_u8_slice(&mut hp[..n], cur, right);
+        avg_u8_slice(&mut vp[..n], cur, below);
+        avg_u8_slice(&mut dp[..n], cur, diag);
     }
     for i in n..plane {
         let at = |k: usize| if k < plane { p0[k] } else { hp[k - plane] };
         let (cur, right, below, diag) = (at(i), at(i + 1), at(i + width), at(i + width + 1));
-        hp[i] = mean(cur, right);
-        vp[i] = mean(cur, below);
-        dp[i] = mean(cur, diag);
+        hp[i] = avg_u8(cur, right);
+        vp[i] = avg_u8(cur, below);
+        dp[i] = avg_u8(cur, diag);
     }
     vp[..width].copy_from_slice(&p0[..width]);
     dp[..width].copy_from_slice(&p0[1..=width]);
     true
 }
 
-fn refine(canvas: &mut Canvas<'_>, level0: Region, pitch: usize, pel: usize, upscale: Upscale) {
-    if pel == 2 && matches!(upscale, Upscale::Bilinear) && refine_bilinear2(canvas, level0, pitch) {
-        return;
+fn refine_bilinear2_strided(canvas: &mut Canvas<'_>, level0: Region, pitch: usize) -> bool {
+    let (width, height) = (level0.width, level0.height);
+    let plane = pitch * height;
+    if width < 2 || height < 2 || pitch < width || level0.offset + 4 * plane > canvas.frame.len() {
+        return false;
+    }
+    let (p0, rest) = canvas.frame[level0.offset..].split_at_mut(plane);
+    let (hp, rest) = rest.split_at_mut(plane);
+    let (vp, rest) = rest.split_at_mut(plane);
+    let dp = &mut rest[..plane];
+    for y in 0..height {
+        let r0 = &p0[y * pitch..][..width];
+        let r1 = &p0[(y + 1).min(height - 1) * pitch..][..width];
+        let hp_row = &mut hp[y * pitch..][..width];
+        avg_u8_slice(&mut hp_row[..width - 1], &r0[..width - 1], &r0[1..width]);
+        hp_row[width - 1] = r0[width - 1];
+        let vp_row = &mut vp[y * pitch..][..width];
+        let dp_row = &mut dp[y * pitch..][..width];
+        if y == 0 {
+            vp_row.copy_from_slice(r0);
+            dp_row[..width - 1].copy_from_slice(&r0[1..width]);
+            dp_row[width - 1] = r0[width - 1];
+        } else {
+            avg_u8_slice(vp_row, r0, r1);
+            avg_u8_slice(&mut dp_row[..width - 1], &r0[..width - 1], &r1[1..width]);
+            dp_row[width - 1] = avg_u8(r0[width - 1], r1[width - 1]);
+        }
+    }
+    true
+}
+
+fn refine(
+    canvas: &mut Canvas<'_>,
+    level0: Region,
+    pitch: usize,
+    pel: usize,
+    upscale: Upscale,
+    fast: bool,
+) {
+    if pel == 2 && matches!(upscale, Upscale::Bilinear) {
+        if refine_bilinear2(canvas, level0, pitch) {
+            return;
+        }
+        if fast && refine_bilinear2_strided(canvas, level0, pitch) {
+            return;
+        }
     }
     let plane = |k: usize| level0.offset + k * pitch * level0.height;
     let (w, h) = (level0.width, level0.height);
@@ -881,15 +1826,6 @@ impl HalfPel {
             Self::Wiener => (2, 4),
         }
     }
-
-    fn apply(self, t: [i32; 6]) -> u8 {
-        let [m2, m1, c0, p1, p2, p3] = t;
-        let value = match self {
-            Self::CatmullRom => (-(m1 + p2) + (c0 + p1) * 9 + 8) >> 4,
-            Self::Wiener => (m2 + (-m1 + (c0 << 2) + (p1 << 2) - p2) * 5 + p3 + 16) >> 5,
-        };
-        value.clamp(0, 255) as u8
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -902,7 +1838,7 @@ struct Interp {
 impl Interp {
     fn pair(self, canvas: &mut Canvas<'_>, dst: usize, first: usize, second: usize) {
         let span = self.width.div_ceil(SSE_CHUNK) * SSE_CHUNK;
-        let (mut a, mut b) = (vec![0u8; span], vec![0u8; span]);
+        let (mut a, mut b, mut out) = (Vec::new(), Vec::new(), Vec::new());
         for y in 0..self.height {
             let row = y * self.pitch;
             let (target, left, right) = (dst + row, first + row, second + row);
@@ -910,17 +1846,18 @@ impl Interp {
                 let (sources, rest) = canvas.frame.split_at_mut(target);
                 let lhs = &sources[left..left + span];
                 let rhs = &sources[right..right + span];
-                for ((out, &l), &r) in rest[..span].iter_mut().zip(lhs).zip(rhs) {
-                    *out = ((u16::from(l) + u16::from(r) + 1) >> 1) as u8;
-                }
+                avg_u8_slice(&mut rest[..span], lhs, rhs);
                 continue;
+            }
+            if a.is_empty() {
+                a.resize(span, 0);
+                b.resize(span, 0);
+                out.resize(span, 0);
             }
             canvas.fetch((first + row) as isize, &mut a);
             canvas.fetch((second + row) as isize, &mut b);
-            for (x, y) in a.iter_mut().zip(&b) {
-                *x = ((u16::from(*x) + u16::from(*y) + 1) >> 1) as u8;
-            }
-            canvas.store(dst + row, &a);
+            avg_u8_slice(&mut out, &a, &b);
+            canvas.store(dst + row, &out);
         }
     }
 
@@ -932,18 +1869,47 @@ impl Interp {
 
     fn horizontal(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
         let (lead, tail) = kernel.edges();
-        let w = self.width;
+        let (w, h, p) = (self.width, self.height, self.pitch);
         let inner = w.saturating_sub(tail).saturating_sub(lead);
+        if w > lead + tail
+            && h > 0
+            && src + (h - 1) * p + w <= dst
+            && dst + (h - 1) * p + w <= canvas.frame.len()
+        {
+            let (sources, rest) = canvas.frame.split_at_mut(dst);
+            for y in 0..h {
+                let row = y * p;
+                let src_row = &sources[src + row..][..w];
+                let dst_row = &mut rest[row..][..w];
+                let taps: [&[u8]; 6] = match kernel {
+                    HalfPel::CatmullRom => [
+                        &src_row[1..=inner],
+                        &src_row[..inner],
+                        &src_row[1..=inner],
+                        &src_row[2..2 + inner],
+                        &src_row[3..3 + inner],
+                        &src_row[1..=inner],
+                    ],
+                    HalfPel::Wiener => std::array::from_fn(|k| &src_row[k..k + inner]),
+                };
+                apply_half_pel(kernel, &mut dst_row[lead..lead + inner], taps);
+                for i in (0..lead).chain(lead + inner..w - 1) {
+                    dst_row[i] = avg_u8(src_row[i], src_row[i + 1]);
+                }
+                dst_row[w - 1] = src_row[w - 1];
+            }
+            return;
+        }
         let mut padded = vec![0u8; w + 5];
         let mut out = vec![0u8; w];
-        for y in 0..self.height {
-            let row = y * self.pitch;
+        for y in 0..h {
+            let row = y * p;
             canvas.fetch((src + row) as isize - 2, &mut padded);
             let taps: [&[u8]; 6] = std::array::from_fn(|k| &padded[lead + k..][..inner]);
             apply_half_pel(kernel, &mut out[lead..lead + inner], taps);
             let pixel = &padded[2..];
             for i in (0..lead).chain(lead + inner..w.saturating_sub(1)) {
-                out[i] = ((u16::from(pixel[i]) + u16::from(pixel[i + 1]) + 1) >> 1) as u8;
+                out[i] = avg_u8(pixel[i], pixel[i + 1]);
             }
             out[w - 1] = pixel[w - 1];
             canvas.store(dst + row, &out);
@@ -952,14 +1918,52 @@ impl Interp {
 
     fn vertical(self, canvas: &mut Canvas<'_>, dst: usize, src: usize, kernel: HalfPel) {
         let (lead, tail) = kernel.edges();
-        let (w, h, p) = (self.width, self.height, self.pitch as isize);
+        let (w, h, p) = (self.width, self.height, self.pitch);
+        if w > 0
+            && h > lead + tail
+            && src + (h - 1) * p + w <= dst
+            && dst + (h - 1) * p + w <= canvas.frame.len()
+        {
+            let (sources, rest) = canvas.frame.split_at_mut(dst);
+            let srow = |j: usize| &sources[src + j * p..][..w];
+            for j in 0..h {
+                let d = &mut rest[j * p..][..w];
+                if j + 1 == h {
+                    d.copy_from_slice(srow(j));
+                } else if j < lead || j >= h - tail {
+                    vertical_average(d, srow(j), srow(j + 1));
+                } else {
+                    let taps: [&[u8]; 6] = match kernel {
+                        HalfPel::CatmullRom => [
+                            srow(j),
+                            srow(j - 1),
+                            srow(j),
+                            srow(j + 1),
+                            srow(j + 2),
+                            srow(j),
+                        ],
+                        HalfPel::Wiener => [
+                            srow(j - 2),
+                            srow(j - 1),
+                            srow(j),
+                            srow(j + 1),
+                            srow(j + 2),
+                            srow(j + 3),
+                        ],
+                    };
+                    apply_half_pel(kernel, d, taps);
+                }
+            }
+            return;
+        }
+        let p_isize = p as isize;
         let mut rows = [const { Vec::new() }; 6];
         let mut out = vec![0u8; w];
         for j in 0..h {
-            let base = (src + j * self.pitch) as isize;
+            let base = (src + j * p) as isize;
             for (k, row) in rows.iter_mut().enumerate() {
                 row.resize(w, 0);
-                canvas.fetch(base + (k as isize - 2) * p, row);
+                canvas.fetch(base + (k as isize - 2) * p_isize, row);
             }
             if j + 1 == h {
                 out.copy_from_slice(&rows[2]);
@@ -968,7 +1972,7 @@ impl Interp {
             } else {
                 apply_half_pel(kernel, &mut out, std::array::from_fn(|k| &rows[k][..w]));
             }
-            canvas.store(dst + j * self.pitch, &out);
+            canvas.store(dst + j * p, &out);
         }
     }
 }
@@ -976,9 +1980,9 @@ impl Interp {
 fn apply_half_pel(kernel: HalfPel, out: &mut [u8], taps: [&[u8]; 6]) {
     let n = out.len();
     let [m2, m1, c0, p1, p2, p3] = taps.map(|t| &t[..n]);
-    for i in 0..n {
-        let t = |r: &[u8]| i32::from(r[i]);
-        out[i] = kernel.apply([t(m2), t(m1), t(c0), t(p1), t(p2), t(p3)]);
+    match kernel {
+        HalfPel::CatmullRom => fir4_u8::<-1, 9, 9, -1, 8, 4>(out, [m1, c0, p1, p2]),
+        HalfPel::Wiener => fir6_u8::<1, -5, 20, 20, -5, 1, 16, 5>(out, [m2, m1, c0, p1, p2, p3]),
     }
 }
 

@@ -2,16 +2,16 @@
 
 ## Purpose
 
-Open SVPflow brings motion-compensated frame interpolation to everyday movie playback on Apple Silicon. This fork builds on [upstream open-svpflow 0.1.3](https://github.com/Z1xus/open-svpflow/tree/badc0de2282d2300303f5b9461919a2bc4dbcf65) and adds a macOS launcher for the user's installed mpv. The goal is to make interpolation easy to configure while preserving normal mpv playback, scaling, subtitles, scripts and user settings.
+Open SVPflow brings motion-compensated frame interpolation to everyday movie playback on Apple Silicon. This fork builds on [upstream open-svpflow 0.1.4](https://github.com/Z1xus/open-svpflow/tree/badc0de73b274d73bb8dad4affece877261338ce) and adds a macOS launcher for the user's installed mpv. The goal is to make interpolation easy to configure while preserving normal mpv playback, scaling, subtitles, scripts and user settings.
 
 ## What the fork adds
 
 - A fix for packed motion vectors with a negative vertical component. Both readers restore the horizontal component affected by the signed vertical value.
-- ARM64 NEON kernels for SAD and SATD in motion estimation. SAD sums absolute pixel differences. SATD sums absolute differences after a Hadamard transform. The optimized kernels preserve the integer costs used to choose motion vectors.
+- Unaligned ARM64 loads for 4×4 SAD and SATD preserve exact motion-search costs for byte-aligned blocks. The remaining NEON implementation comes from upstream.
 - ARM64 NEON for six-tap cubic downsampling in Super. Both passes preserve the integer weights, rounding and edge handling. Remaining samples use the scalar path.
 - Precomputed cubic weights for 8-bit OpenCL shader 23 on Apple Silicon. The zero-origin 16-pixel field grid uses the same texture reads and blend order with shared coordinates and weights.
 - Shared GPU motion-field sampling for compatible 8-bit YUV420 chroma planes with shader 23. A paired U/V dispatch uses the existing pixel sampling and rounding helpers. Eligibility checks cover packed source offsets, matching plane parameters, and compatibility with optional effects.
-- Batched OpenCL uploads and direct readback for 8-bit video on Apple Silicon. The blocking V upload depends on the queued Y and U uploads. GPU output goes directly into the destination planes. On error, wait for accepted transfers before returning frame buffers. If OpenCL cannot confirm completion, abort the host process to protect that memory.
+- OpenCL frame transfer error handling. Wait for accepted transfers before returning frame buffers. If OpenCL cannot confirm completion, abort the host process to protect that memory.
 - A Python launcher and VapourSynth graph that validate settings, prepare input frames, and apply interpolation at the requested rate. The mpv input normalizer can fit the processing size to the rendered video while preserving its aspect ratio. The graph crops any padding added during frame preparation.
 - A SwiftUI launcher with file drop, playlist management, localized settings and a compact playback-quality view. An independent mpv session keeps playing when the launcher quits.
 - A GitHub Actions build that tests the engine and launcher, exercises the extracted application with external mpv, and checks the published ARM64 ZIP. The ZIP contains one ad-hoc signed app bundle with the launcher and plugins.

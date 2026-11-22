@@ -6,10 +6,10 @@ use core::arch::x86_64::{__m128i, _mm_unpacklo_epi64};
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 use core::arch::x86_64::{
     __m256i, _mm256_abs_epi16, _mm256_add_epi16, _mm256_add_epi32, _mm256_add_epi64,
-    _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_extracti128_si256,
-    _mm256_hadd_epi16, _mm256_hsub_epi16, _mm256_inserti128_si256, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_max_epi16, _mm256_sad_epu8, _mm256_set1_epi16, _mm256_setzero_si256,
-    _mm256_sub_epi16,
+    _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+    _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+    _mm256_max_epi16, _mm256_sad_epu8, _mm256_set_m128i, _mm256_set1_epi32, _mm256_setr_epi8,
+    _mm256_setzero_si256, _mm256_srli_epi32, _mm256_sub_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::{
@@ -48,6 +48,19 @@ pub(crate) fn luma_kernel(shape: Shape, satd: bool) -> Kernel {
         (32, 32, true) => satd_rows32::<32>,
         (32, 16, true) => satd_rows32::<16>,
         _ => generic(shape, satd),
+    }
+}
+
+pub(crate) fn luma_strided_kernel(shape: Shape) -> Kernel {
+    match (shape.width, shape.height) {
+        (32, 32) => sad_strided::<32, 32>,
+        (32, 16) => sad_strided::<32, 16>,
+        (16, 16) => sad_strided::<16, 16>,
+        (16, 8) => sad_strided::<16, 8>,
+        (8, 8) => sad_strided::<8, 8>,
+        (8, 4) => sad_strided::<8, 4>,
+        (4, 4) => sad_strided::<4, 4>,
+        _ => generic(shape, false),
     }
 }
 
@@ -125,6 +138,11 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
         let sum = unsafe { contiguous_sum(&block[..shape.area()]) };
         return (sum >> shape.area().trailing_zeros()) as i32;
     }
+    #[cfg(target_arch = "aarch64")]
+    if pitch == shape.width && shape.area().is_multiple_of(16) {
+        let sum = neon::contiguous_sum(&block[..shape.area()]);
+        return (sum >> shape.area().trailing_zeros()) as i32;
+    }
     let sum = match shape.width {
         2 => rows_sum::<2>(block, pitch, shape.height),
         4 => rows_sum::<4>(block, pitch, shape.height),
@@ -136,8 +154,67 @@ pub(crate) fn block_average(block: &[u8], pitch: usize, shape: Shape) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn contiguous_sum(block: &[u8]) -> u32 {
+    if block.len() >= 64 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe { contiguous_sum_avx512(block) };
+    }
+    if block.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { contiguous_sum_avx2(block) };
+    }
+    unsafe { contiguous_sum_sse2(block) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn contiguous_sum_avx512(block: &[u8]) -> u32 {
+    use core::arch::x86_64::{
+        _mm512_add_epi64, _mm512_loadu_si512, _mm512_reduce_add_epi64, _mm512_sad_epu8,
+        _mm512_setzero_si512,
+    };
+    let zero = _mm512_setzero_si512();
+    let mut acc = zero;
+    let (chunks, rem) = block.as_chunks::<64>();
+    for chunk in chunks {
+        let value = unsafe { _mm512_loadu_si512(chunk.as_ptr().cast()) };
+        acc = _mm512_add_epi64(acc, _mm512_sad_epu8(value, zero));
+    }
+    let total = _mm512_reduce_add_epi64(acc) as u32;
+    if rem.is_empty() {
+        total
+    } else {
+        total + unsafe { contiguous_sum_sse2(rem) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn contiguous_sum_avx2(block: &[u8]) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_add_epi64, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_sad_epu8, _mm256_setzero_si256,
+    };
+    let zero = _mm256_setzero_si256();
+    let mut acc = zero;
+    let (chunks, rem) = block.as_chunks::<32>();
+    for chunk in chunks {
+        let value = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast()) };
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(value, zero));
+    }
+    let sum = _mm_add_epi64(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    let total = _mm_cvtsi128_si32(_mm_add_epi32(sum, _mm_shuffle_epi32::<0b1110>(sum))) as u32;
+    if rem.is_empty() {
+        total
+    } else {
+        total + unsafe { contiguous_sum_sse2(rem) }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn contiguous_sum_sse2(block: &[u8]) -> u32 {
     let mut acc = _mm_setzero_si128();
     for chunk in block.as_chunks::<16>().0 {
         let value = unsafe { _mm_loadu_si128(chunk.as_ptr().cast()) };
@@ -158,8 +235,13 @@ fn rows_sum<const W: usize>(block: &[u8], pitch: usize, height: usize) -> u32 {
 
 fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if (W == 8 || W == 16) && H.is_multiple_of(2) {
+    if (W == 8 || W == 16 || W == 32) && H.is_multiple_of(2) {
         assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+        if W == 32 && std::arch::is_x86_feature_detected!("avx512bw") {
+            return unsafe {
+                sad_rows_pitched_avx512::<32>(src.as_ptr(), W, reference.as_ptr(), pitch, H)
+            };
+        }
         return unsafe { sad_until::<W, H>(src.as_ptr(), reference.as_ptr(), pitch, |_| false) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -167,167 +249,74 @@ fn sad<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usiz
         assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
         return unsafe { sad_rows_pitched::<W>(src.as_ptr(), W, reference.as_ptr(), pitch, H) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if W >= 4 {
+        return neon::sad(src, W, reference, pitch, W, H);
+    }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if W >= 4 {
         return simd128::sad(src, W, reference, pitch, W, H);
     }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        target_feature = "neon"
-    ))]
-    if matches!((W, H), (4, 4) | (8, 4 | 8) | (16, 8 | 16) | (32, 16 | 32)) {
-        assert!(
-            src.len() >= W * H && reference.len() >= W && pitch <= (reference.len() - W) / (H - 1)
-        );
-        return unsafe { neon::sad::<W, H>(src.as_ptr(), reference.as_ptr(), pitch) };
-    }
     sad_scalar(src, reference, pitch, W, H)
 }
 
-#[cfg(all(
-    target_arch = "aarch64",
-    target_endian = "little",
-    target_feature = "neon"
-))]
-mod neon {
-    use core::arch::aarch64::{
-        int16x8_t, uint8x16_t, uint16x8_t, vabd_u8, vabdq_u8, vabsq_s16, vaddlv_u16, vaddlvq_u8,
-        vaddlvq_u16, vaddq_s16, vaddq_u16, vcreate_u8, vdup_n_u16, vdupq_n_u16, vdupq_n_u32,
-        vld1_u8, vld1q_u8, vmaxq_s16, vpadal_u8, vpadalq_u8, vreinterpretq_s16_u16,
-        vreinterpretq_u8_u32, vreinterpretq_u16_s16, vrev32q_s16, vrev64q_s16, vsetq_lane_u32,
-        vsubl_u8, vsubq_s16,
-    };
-
-    #[inline(always)]
-    pub(super) unsafe fn sad<const W: usize, const H: usize>(
-        src: *const u8,
-        reference: *const u8,
-        pitch: usize,
-    ) -> u32 {
-        unsafe {
-            if W == 4 {
-                return sad_4x4(src, reference, pitch);
-            }
-            if W == 8 {
-                let mut sum = vdup_n_u16(0);
-                for row in 0..H {
-                    let a = vld1_u8(src.add(row * W));
-                    let b = vld1_u8(reference.add(row * pitch));
-                    sum = vpadal_u8(sum, vabd_u8(a, b));
-                }
-                return vaddlv_u16(sum);
-            }
-            if W == 32 && H == 32 {
-                let mut sum = 0;
-                for row in 0..H {
-                    let a = src.add(row * W);
-                    let b = reference.add(row * pitch);
-                    let left = vaddlvq_u8(diff16(a, b));
-                    let right = vaddlvq_u8(diff16(a.add(16), b.add(16)));
-                    sum += u32::from(left + right);
-                }
-                return sum;
-            }
-            let mut first = vdupq_n_u16(0);
-            let mut second = vdupq_n_u16(0);
-            for row in 0..H {
-                let a = src.add(row * W);
-                let b = reference.add(row * pitch);
-                first = vpadalq_u8(first, diff16(a, b));
-                if W == 32 {
-                    second = vpadalq_u8(second, diff16(a.add(16), b.add(16)));
-                }
-            }
-            vaddlvq_u16(vaddq_u16(first, second))
-        }
+fn sad_strided<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+    #[cfg(target_arch = "x86_64")]
+    if W >= 8 {
+        return unsafe {
+            sad_rows_pitched::<W>(src.as_ptr(), W * 2, reference.as_ptr(), pitch * 2, H / 2)
+        } << 1;
     }
-
-    #[inline(always)]
-    pub(super) unsafe fn satd<const W: usize, const H: usize>(
-        src: *const u8,
-        reference: *const u8,
-        pitch: usize,
-    ) -> u32 {
-        let mut total = 0;
-        for y in (0..H).step_by(4) {
-            for x in (0..W).step_by(8) {
-                let [first, second, third, fourth] = std::array::from_fn(|row| unsafe {
-                    let src = src.add((y + row) * W + x);
-                    let reference = reference.add((y + row) * pitch + x);
-                    let (src, reference) = if W == 4 {
-                        (
-                            vcreate_u8(u64::from(src.cast::<u32>().read_unaligned())),
-                            vcreate_u8(u64::from(reference.cast::<u32>().read_unaligned())),
-                        )
-                    } else {
-                        (vld1_u8(src), vld1_u8(reference))
-                    };
-                    vreinterpretq_s16_u16(vsubl_u8(src, reference))
-                });
-                unsafe {
-                    let top_sum = vaddq_s16(first, second);
-                    let bottom_sum = vaddq_s16(third, fourth);
-                    let top_diff = vsubq_s16(first, second);
-                    let bottom_diff = vsubq_s16(third, fourth);
-                    let sums = vaddq_u16(
-                        satd_horizontal(vaddq_s16(top_sum, bottom_sum)),
-                        satd_horizontal(vsubq_s16(top_sum, bottom_sum)),
-                    );
-                    let diffs = vaddq_u16(
-                        satd_horizontal(vaddq_s16(top_diff, bottom_diff)),
-                        satd_horizontal(vsubq_s16(top_diff, bottom_diff)),
-                    );
-                    total += vaddlvq_u16(vaddq_u16(sums, diffs));
-                }
-            }
-        }
-        total / 4
+    #[cfg(target_arch = "aarch64")]
+    if W >= 4 {
+        return neon::sad(src, W * 2, reference, pitch * 2, W, H / 2) << 1;
     }
-
-    #[inline(always)]
-    unsafe fn satd_horizontal(row: int16x8_t) -> uint16x8_t {
-        unsafe {
-            let swap = vrev32q_s16(row);
-            let sums = vabsq_s16(vaddq_s16(row, swap));
-            let diffs = vabsq_s16(vsubq_s16(row, swap));
-            let sum_max = vmaxq_s16(sums, vrev64q_s16(sums));
-            let diff_max = vmaxq_s16(diffs, vrev64q_s16(diffs));
-            vreinterpretq_u16_s16(vaddq_s16(sum_max, diff_max))
-        }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if W >= 4 {
+        return simd128::sad(src, W * 2, reference, pitch * 2, W, H / 2) << 1;
     }
-
-    #[inline(always)]
-    unsafe fn sad_4x4(src: *const u8, reference: *const u8, pitch: usize) -> u32 {
-        unsafe {
-            let load_row = |row| reference.add(row * pitch).cast::<u32>().read_unaligned();
-            let rows = vdupq_n_u32(load_row(0));
-            let rows = vsetq_lane_u32::<1>(load_row(1), rows);
-            let rows = vsetq_lane_u32::<2>(load_row(2), rows);
-            let rows = vsetq_lane_u32::<3>(load_row(3), rows);
-            let source = vld1q_u8(src);
-            u32::from(vaddlvq_u8(vabdq_u8(source, vreinterpretq_u8_u32(rows))))
-        }
+    let mut sum = 0u32;
+    for row in (0..H).step_by(2) {
+        let s = &src[row * W..][..W];
+        let r = &reference[row * pitch..][..W];
+        sum += s
+            .iter()
+            .zip(r)
+            .map(|(&a, &b)| u32::from(a.abs_diff(b)))
+            .sum::<u32>();
     }
+    sum << 1
+}
 
-    #[inline(always)]
-    unsafe fn diff16(src: *const u8, reference: *const u8) -> uint8x16_t {
-        unsafe { vabdq_u8(vld1q_u8(src), vld1q_u8(reference)) }
+pub(crate) fn sad_pitched_strided(
+    shape: Shape,
+    a: &[u8],
+    a_pitch: usize,
+    b: &[u8],
+    b_pitch: usize,
+) -> u32 {
+    if shape.height < 4 || !shape.height.is_multiple_of(2) {
+        return sad_pitched(shape, a, a_pitch, b, b_pitch);
     }
+    let half = Shape::new(shape.width, shape.height / 2);
+    sad_pitched(half, a, a_pitch * 2, b, b_pitch * 2) << 1
 }
 
 pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pitch: usize) -> u32 {
     assert!(a.len() >= shape.span(a_pitch) && b.len() >= shape.span(b_pitch));
+    #[cfg(target_arch = "aarch64")]
+    if shape.width >= 4 && shape.width.is_multiple_of(4) {
+        return neon::sad(a, a_pitch, b, b_pitch, shape.width, shape.height);
+    }
     #[cfg(target_arch = "x86_64")]
     unsafe {
         let (a, b) = (a.as_ptr(), b.as_ptr());
         match (shape.width, shape.height) {
             (4, 4) => return sad_4x4_pitched(a, a_pitch, b, b_pitch),
-            (8, 8) => return sad_rows_pitched::<8>(a, a_pitch, b, b_pitch, 8),
-            (16, 8) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 8),
-            (16, 16) => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, 16),
-            (32, 16) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 16),
-            (32, 32) => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, 32),
+            (8, h) if h >= 2 => return sad_rows_pitched::<8>(a, a_pitch, b, b_pitch, h),
+            (16, h) if h >= 2 => return sad_rows_pitched::<16>(a, a_pitch, b, b_pitch, h),
+            (32, h) if h >= 2 => return sad_rows_pitched::<32>(a, a_pitch, b, b_pitch, h),
             _ => {}
         }
     }
@@ -343,8 +332,175 @@ pub(crate) fn sad_pitched(shape: Shape, a: &[u8], a_pitch: usize, b: &[u8], b_pi
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
 unsafe fn sad_rows_pitched<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    if W >= 16 && height >= 2 && std::arch::is_x86_feature_detected!("avx512bw") {
+        return unsafe {
+            sad_rows_pitched_avx512::<W>(src, src_pitch, reference, reference_pitch, height)
+        };
+    }
+    if W >= 16 && std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe {
+            sad_rows_pitched_avx2::<W>(src, src_pitch, reference, reference_pitch, height)
+        };
+    }
+    unsafe { sad_rows_pitched_sse2::<W>(src, src_pitch, reference, reference_pitch, height) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn sad_rows_pitched_avx512<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_castsi128_si256, _mm256_inserti128_si256, _mm256_loadu_si256, _mm512_add_epi64,
+        _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_reduce_add_epi64, _mm512_sad_epu8,
+        _mm512_setzero_si512,
+    };
+    let mut acc = _mm512_setzero_si512();
+    let mut row = 0;
+    if W == 32 {
+        while row + 2 <= height {
+            let (a, b) = unsafe {
+                let s0 = _mm256_loadu_si256(src.add(row * src_pitch).cast());
+                let s1 = _mm256_loadu_si256(src.add((row + 1) * src_pitch).cast());
+                let r0 = _mm256_loadu_si256(reference.add(row * reference_pitch).cast());
+                let r1 = _mm256_loadu_si256(reference.add((row + 1) * reference_pitch).cast());
+                (
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(s0), s1),
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(r0), r1),
+                )
+            };
+            acc = _mm512_add_epi64(acc, _mm512_sad_epu8(a, b));
+            row += 2;
+        }
+    } else if W == 16 {
+        while row + 4 <= height {
+            let (a, b) = unsafe {
+                let s01 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add(row * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 1) * src_pitch).cast()),
+                );
+                let s23 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add((row + 2) * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 3) * src_pitch).cast()),
+                );
+                let r01 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add(row * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 1) * reference_pitch).cast()),
+                );
+                let r23 = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add((row + 2) * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 3) * reference_pitch).cast()),
+                );
+                (
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(s01), s23),
+                    _mm512_inserti64x4::<1>(_mm512_castsi256_si512(r01), r23),
+                )
+            };
+            acc = _mm512_add_epi64(acc, _mm512_sad_epu8(a, b));
+            row += 4;
+        }
+    }
+    let total = _mm512_reduce_add_epi64(acc) as u32;
+    if row < height {
+        total
+            + unsafe {
+                sad_rows_pitched_avx2::<W>(
+                    src.add(row * src_pitch),
+                    src_pitch,
+                    reference.add(row * reference_pitch),
+                    reference_pitch,
+                    height - row,
+                )
+            }
+    } else {
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_rows_pitched_avx2<const W: usize>(
+    src: *const u8,
+    src_pitch: usize,
+    reference: *const u8,
+    reference_pitch: usize,
+    height: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm256_add_epi64, _mm256_castsi128_si256, _mm256_castsi256_si128, _mm256_extracti128_si256,
+        _mm256_inserti128_si256, _mm256_loadu_si256, _mm256_sad_epu8, _mm256_setzero_si256,
+    };
+    let mut acc = _mm256_setzero_si256();
+    let mut row = 0;
+    if W == 32 {
+        while row < height {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(src.add(row * src_pitch).cast()),
+                    _mm256_loadu_si256(reference.add(row * reference_pitch).cast()),
+                )
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            row += 1;
+        }
+    } else if W == 16 {
+        while row + 2 <= height {
+            let (a, b) = unsafe {
+                let s = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(src.add(row * src_pitch).cast())),
+                    _mm_loadu_si128(src.add((row + 1) * src_pitch).cast()),
+                );
+                let r = _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(
+                        reference.add(row * reference_pitch).cast(),
+                    )),
+                    _mm_loadu_si128(reference.add((row + 1) * reference_pitch).cast()),
+                );
+                (s, r)
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            row += 2;
+        }
+    }
+    let sum = _mm_add_epi64(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256::<1>(acc),
+    );
+    let total = _mm_cvtsi128_si32(_mm_add_epi32(sum, _mm_shuffle_epi32::<0b1110>(sum))) as u32;
+    if row < height {
+        total
+            + unsafe {
+                sad_rows_pitched_sse2::<W>(
+                    src.add(row * src_pitch),
+                    src_pitch,
+                    reference.add(row * reference_pitch),
+                    reference_pitch,
+                    height - row,
+                )
+            }
+    } else {
+        total
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn sad_rows_pitched_sse2<const W: usize>(
     src: *const u8,
     src_pitch: usize,
     reference: *const u8,
@@ -406,103 +562,6 @@ fn sad_scalar(src: &[u8], reference: &[u8], pitch: usize, width: usize, height: 
     sum
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Shape, luma_kernel, sad_scalar};
-
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        target_feature = "neon"
-    ))]
-    #[test]
-    fn neon_satd_matches_scalar() {
-        use super::{neon, satd_scalar};
-
-        fn compare<const W: usize, const H: usize>() {
-            let mut state = 73u32;
-            let mut next = || {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state >> 24) as u8
-            };
-            for pitch in [0, W - 1, W, W + 1, W + 13, 1920] {
-                for offset in 0..16 {
-                    let mut src: Vec<u8> = (0..W * H + offset).map(|_| next()).collect();
-                    let mut reference: Vec<u8> = (0..(H - 1) * pitch + W + 15 - offset)
-                        .map(|_| next())
-                        .collect();
-                    let src = &mut src[offset..];
-                    let reference = &mut reference[15 - offset..];
-                    let check = |src: &[u8], reference: &[u8]| {
-                        let actual =
-                            unsafe { neon::satd::<W, H>(src.as_ptr(), reference.as_ptr(), pitch) };
-                        assert_eq!(actual, satd_scalar(src, W, reference, pitch, W, H));
-                    };
-                    check(src, reference);
-                    src.fill(0);
-                    reference.fill(u8::MAX);
-                    check(src, reference);
-                    src.fill(u8::MAX);
-                    reference.fill(0);
-                    check(src, reference);
-                }
-            }
-        }
-
-        compare::<4, 4>();
-        compare::<8, 4>();
-        compare::<8, 8>();
-        compare::<16, 8>();
-        compare::<16, 16>();
-        compare::<32, 16>();
-        compare::<32, 32>();
-    }
-
-    #[test]
-    fn packed_sad_matches_scalar() {
-        for (width, height) in [
-            (4, 4),
-            (8, 4),
-            (8, 8),
-            (16, 8),
-            (16, 16),
-            (32, 16),
-            (32, 32),
-        ] {
-            let shape = Shape::new(width, height);
-            let kernel = luma_kernel(shape, false);
-            let mut state = 1u32;
-            let mut random_byte = || {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state >> 24) as u8
-            };
-            for pitch in [0, width - 1, width, width + 1, width + 13, 256, 1920] {
-                for offset in 0..16 {
-                    let mut src: Vec<u8> =
-                        (0..shape.area() + offset).map(|_| random_byte()).collect();
-                    let mut reference: Vec<u8> = (0..shape.span(pitch) + 16 - offset)
-                        .map(|_| random_byte())
-                        .collect();
-                    let src = &mut src[offset..];
-                    let reference = &mut reference[16 - offset..];
-                    assert_eq!(
-                        kernel(src, reference, pitch),
-                        sad_scalar(src, reference, pitch, width, height),
-                        "{width}x{height}, pitch {pitch}, offset {offset}"
-                    );
-                    src.fill(0);
-                    reference.fill(u8::MAX);
-                    assert_eq!(kernel(src, reference, pitch), 255 * shape.area() as u32);
-                }
-            }
-        }
-    }
-}
-
 fn sad_2x2_swapped(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
     sad_rows_swapped(src, reference, pitch, 2)
 }
@@ -525,6 +584,10 @@ fn sad_rows_swapped(src: &[u8], reference: &[u8], pitch: usize, width: usize) ->
 }
 
 fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if W.is_multiple_of(4) && H.is_multiple_of(4) {
+        return neon::satd(src, W, reference, pitch, W, H);
+    }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     if W.is_multiple_of(4) && H.is_multiple_of(4) {
         return simd128::satd(src, W, reference, pitch, W, H);
@@ -540,17 +603,6 @@ fn satd<const W: usize, const H: usize>(src: &[u8], reference: &[u8], pitch: usi
     #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
     if W == 4 && H == 4 {
         return unsafe { satd_4x4_ssse3(src, reference, pitch) };
-    }
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_endian = "little",
-        target_feature = "neon"
-    ))]
-    if matches!((W, H), (4, 4) | (8, 4 | 8) | (16, 8 | 16) | (32, 16 | 32)) {
-        assert!(
-            src.len() >= W * H && reference.len() >= W && pitch <= (reference.len() - W) / (H - 1)
-        );
-        return unsafe { neon::satd::<W, H>(src.as_ptr(), reference.as_ptr(), pitch) };
     }
     satd_scalar(src, W, reference, pitch, W, H)
 }
@@ -597,6 +649,19 @@ fn hadamard4x4_abs_sum(mut d: [[i32; 4]; 4]) -> u32 {
 }
 
 fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    return (0..H)
+        .map(|row| {
+            neon::satd(
+                &src[row * 32..][..32],
+                8,
+                &reference[row * pitch..][..32],
+                8,
+                8,
+                4,
+            )
+        })
+        .sum();
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     return (0..H)
         .map(|row| {
@@ -610,6 +675,12 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
             )
         })
         .sum();
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        return unsafe { satd_rows32_avx512::<H>(src, reference, pitch) };
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     return unsafe { satd_rows32_avx2::<H>(src, reference, pitch) };
     #[allow(unreachable_code)]
@@ -627,9 +698,83 @@ fn satd_rows32<const H: usize>(src: &[u8], reference: &[u8], pitch: usize) -> u3
         .sum()
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn satd_rows32_avx512<const H: usize>(
+    src: &[u8],
+    reference: &[u8],
+    pitch: usize,
+) -> u32 {
+    use core::arch::x86_64::{
+        _mm512_add_epi32, _mm512_madd_epi16, _mm512_reduce_add_epi32, _mm512_set1_epi32,
+        _mm512_setzero_si512,
+    };
+    assert!(src.len() >= 32 * H && reference.len() >= (H - 1) * pitch + 32);
+    let (s, r) = (src.as_ptr(), reference.as_ptr());
+    let mut acc = _mm512_setzero_si512();
+    let one = _mm512_set1_epi32(1);
+    for row in (0..H).step_by(2) {
+        let s0 = unsafe { s.add(row * 32) };
+        let r0 = unsafe { r.add(row * pitch) };
+        let (s1, r1) = if row + 1 < H {
+            unsafe { (s.add((row + 1) * 32), r.add((row + 1) * pitch)) }
+        } else {
+            (s0, r0)
+        };
+        let block = unsafe {
+            let sw = widen_rows_avx512([
+                s0,
+                s0.add(8),
+                s0.add(16),
+                s0.add(24),
+                s1,
+                s1.add(8),
+                s1.add(16),
+                s1.add(24),
+            ]);
+            let rw = widen_rows_avx512([
+                r0,
+                r0.add(8),
+                r0.add(16),
+                r0.add(24),
+                r1,
+                r1.add(8),
+                r1.add(16),
+                r1.add(24),
+            ]);
+            satd_8x8_from_avx512(sw, rw)
+        };
+        let term = _mm512_madd_epi16(block, one);
+        if row + 1 < H {
+            acc = _mm512_add_epi32(acc, term);
+        } else {
+            use core::arch::x86_64::_mm512_mask_add_epi32;
+            acc = _mm512_mask_add_epi32(acc, 0x00ff, acc, term);
+        }
+    }
+    _mm512_reduce_add_epi32(acc) as u32
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 const fn rows_per_tile(width: usize) -> usize {
     if width == 8 { 8 } else { 4 }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn hmul_avx2() -> __m256i {
+    _mm256_setr_epi8(
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1, 1, -1,
+        1, -1, 1, -1,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn widen_16_avx2(row: __m128i, hmul: __m256i) -> __m256i {
+    _mm256_maddubs_epi16(_mm256_set_m128i(row, row), hmul)
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -639,17 +784,17 @@ unsafe fn load_tile<const W: usize>(
     stride: usize,
     ty: usize,
     tx: usize,
+    hmul: __m256i,
 ) -> [__m256i; 4] {
     std::array::from_fn(|y| {
-        if W == 8 {
+        let row = if W == 8 {
             let low = unsafe { _mm_loadl_epi64(base.add((ty + y) * stride + tx).cast()) };
             let high = unsafe { _mm_loadl_epi64(base.add((ty + y + 4) * stride + tx).cast()) };
-            _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(low, high))
+            _mm_unpacklo_epi64(low, high)
         } else {
-            _mm256_cvtepu8_epi16(unsafe {
-                _mm_loadu_si128(base.add((ty + y) * stride + tx).cast())
-            })
-        }
+            unsafe { _mm_loadu_si128(base.add((ty + y) * stride + tx).cast()) }
+        };
+        widen_16_avx2(row, hmul)
     })
 }
 
@@ -659,17 +804,15 @@ unsafe fn load_tile<const W: usize>(
 fn tile_maxima([r0, r1, r2, r3]: [__m256i; 4]) -> __m256i {
     let (s0, d0) = (_mm256_add_epi16(r0, r1), _mm256_sub_epi16(r0, r1));
     let (s1, d1) = (_mm256_add_epi16(r2, r3), _mm256_sub_epi16(r2, r3));
-    let pair = |a: __m256i, b: __m256i| {
-        let sums = _mm256_hadd_epi16(a, b);
-        let diffs = _mm256_hsub_epi16(a, b);
-        (
-            _mm256_abs_epi16(_mm256_hadd_epi16(sums, diffs)),
-            _mm256_abs_epi16(_mm256_hsub_epi16(sums, diffs)),
-        )
+    let fold = |v: __m256i| {
+        let a = _mm256_abs_epi16(v);
+        _mm256_max_epi16(a, _mm256_srli_epi32::<16>(a))
     };
-    let (x0, y0) = pair(s0, d0);
-    let (x1, y1) = pair(s1, d1);
-    _mm256_add_epi16(_mm256_max_epi16(x0, x1), _mm256_max_epi16(y0, y1))
+    let m0 = fold(_mm256_add_epi16(s0, s1));
+    let m1 = fold(_mm256_sub_epi16(s0, s1));
+    let m2 = fold(_mm256_add_epi16(d0, d1));
+    let m3 = fold(_mm256_sub_epi16(d0, d1));
+    _mm256_add_epi16(_mm256_add_epi16(m0, m1), _mm256_add_epi16(m2, m3))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -693,16 +836,15 @@ unsafe fn satd_avx2<const W: usize, const H: usize>(
     pitch: usize,
 ) -> u32 {
     assert!(src.len() >= W * H && reference.len() >= (H - 1) * pitch + W);
+    let hmul = hmul_avx2();
+    let one = _mm256_set1_epi32(1);
     let mut acc = _mm256_setzero_si256();
     for ty in (0..H).step_by(rows_per_tile(W)) {
         for tx in (0..W).step_by(16) {
-            let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx) };
-            let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx) };
+            let s = unsafe { load_tile::<W>(src.as_ptr(), W, ty, tx, hmul) };
+            let r = unsafe { load_tile::<W>(reference.as_ptr(), pitch, ty, tx, hmul) };
             let diff = std::array::from_fn(|k| _mm256_sub_epi16(s[k], r[k]));
-            acc = _mm256_add_epi32(
-                acc,
-                _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1)),
-            );
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(tile_maxima(diff), one));
         }
     }
     horizontal_sum(acc)
@@ -717,18 +859,19 @@ unsafe fn satd_8x4_tiles(
     reference: [Option<*const u8>; 2],
     pitch: usize,
 ) -> __m256i {
+    let hmul = hmul_avx2();
     let load = |base: [Option<*const u8>; 2], stride: usize, y: usize| {
         let half = |ptr: Option<*const u8>| {
             ptr.map_or(_mm_setzero_si128(), |ptr| unsafe {
                 _mm_loadl_epi64(ptr.add(y * stride).cast())
             })
         };
-        _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(half(base[0]), half(base[1])))
+        widen_16_avx2(_mm_unpacklo_epi64(half(base[0]), half(base[1])), hmul)
     };
     let diff = std::array::from_fn(|y| {
         _mm256_sub_epi16(load(src, src_pitch, y), load(reference, pitch, y))
     });
-    _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi16(1))
+    _mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi32(1))
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -884,19 +1027,26 @@ unsafe fn widen_8x8_avx512(base: *const u8, stride: usize) -> [core::arch::x86_6
 #[inline]
 unsafe fn widen_rows_avx512(rows: [*const u8; 8]) -> [core::arch::x86_64::__m512i; 2] {
     use core::arch::x86_64::{
-        _mm256_mask_set1_epi64, _mm256_set1_epi64x, _mm256_setr_epi8, _mm512_broadcast_i64x4,
-        _mm512_maddubs_epi16, _mm512_mask_set1_epi64, _mm512_zextsi256_si512,
+        _mm_unpacklo_epi64, _mm256_set_m128i, _mm256_setr_epi8, _mm512_broadcast_i64x4,
+        _mm512_castsi256_si512, _mm512_inserti64x4, _mm512_maddubs_epi16,
     };
-    macro_rules! row {
-        ($y:expr) => {
-            unsafe { rows[$y].cast::<i64>().read_unaligned() }
-        };
-    }
     macro_rules! gather {
         ($a:expr, $b:expr, $c:expr, $d:expr) => {{
-            let low = _mm256_mask_set1_epi64(_mm256_set1_epi64x(row!($a)), 0b0101, row!($b));
-            let wide = _mm512_mask_set1_epi64(_mm512_zextsi256_si512(low), 0b1010_0000, row!($c));
-            _mm512_mask_set1_epi64(wide, 0b0101_0000, row!($d))
+            let ba = unsafe {
+                _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(rows[$b].cast()),
+                    _mm_loadl_epi64(rows[$a].cast()),
+                )
+            };
+            let dc = unsafe {
+                _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(rows[$d].cast()),
+                    _mm_loadl_epi64(rows[$c].cast()),
+                )
+            };
+            let lo = _mm256_set_m128i(ba, ba);
+            let hi = _mm256_set_m128i(dc, dc);
+            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo), hi)
         }};
     }
     let hmul = _mm512_broadcast_i64x4(_mm256_setr_epi8(
@@ -986,6 +1136,24 @@ unsafe fn sad_until<const W: usize, const H: usize>(
     stop: impl Fn(u32) -> bool,
 ) -> u32 {
     let mut acc = _mm256_setzero_si256();
+    if W == 32 {
+        for row in 0..H {
+            let (a, b) = unsafe {
+                (
+                    _mm256_loadu_si256(src.add(row * W).cast()),
+                    _mm256_loadu_si256(reference.add(row * pitch).cast()),
+                )
+            };
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(a, b));
+            if row + 1 == H / 2 {
+                let total = sad_total(acc);
+                if stop(total) {
+                    return total;
+                }
+            }
+        }
+        return sad_total(acc);
+    }
     for row in (0..H).step_by(2) {
         let (a, b) = unsafe {
             let r0 = reference.add(row * pitch);
@@ -1345,33 +1513,19 @@ unsafe fn satd_avx512<const W: usize, const H: usize>(
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[target_feature(enable = "avx2")]
 unsafe fn satd_4x4_pair_avx2(src: [&[u8]; 2], reference: [&[u8]; 2], pitch: usize) -> u32 {
-    use core::arch::x86_64::{
-        _mm256_set_m128i, _mm256_set1_epi32, _mm256_srli_epi32, _mm256_unpackhi_epi64,
-        _mm256_unpacklo_epi64,
+    use core::arch::x86_64::{_mm_cvtsi32_si128, _mm_unpacklo_epi32};
+    let hmul = hmul_avx2();
+    let load = |pair: [&[u8]; 2], stride: usize, y: usize| {
+        let a = _mm_cvtsi32_si128(unsafe {
+            pair[0].as_ptr().add(y * stride).cast::<i32>().read_unaligned()
+        });
+        let b = _mm_cvtsi32_si128(unsafe {
+            pair[1].as_ptr().add(y * stride).cast::<i32>().read_unaligned()
+        });
+        widen_16_avx2(_mm_unpacklo_epi32(a, b), hmul)
     };
-    let s: [[__m128i; 2]; 2] = src.map(|p| unsafe { rows_4x4(p.as_ptr(), 4) });
-    let r: [[__m128i; 2]; 2] = reference.map(|p| unsafe { rows_4x4(p.as_ptr(), pitch) });
-    let even = _mm256_sub_epi16(
-        _mm256_set_m128i(s[1][0], s[0][0]),
-        _mm256_set_m128i(r[1][0], r[0][0]),
-    );
-    let odd = _mm256_sub_epi16(
-        _mm256_set_m128i(s[1][1], s[0][1]),
-        _mm256_set_m128i(r[1][1], r[0][1]),
-    );
-    let columns = |v: __m256i| {
-        let swapped = _mm256_unpackhi_epi64(v, v);
-        _mm256_unpacklo_epi64(_mm256_add_epi16(v, swapped), _mm256_sub_epi16(v, swapped))
-    };
-    let a = columns(_mm256_add_epi16(even, odd));
-    let b = columns(_mm256_sub_epi16(even, odd));
-    let sums = _mm256_abs_epi16(_mm256_hadd_epi16(a, b));
-    let diffs = _mm256_abs_epi16(_mm256_hsub_epi16(a, b));
-    let maxima = _mm256_add_epi16(
-        _mm256_max_epi16(sums, _mm256_srli_epi32::<16>(sums)),
-        _mm256_max_epi16(diffs, _mm256_srli_epi32::<16>(diffs)),
-    );
-    horizontal_sum(_mm256_madd_epi16(maxima, _mm256_set1_epi32(1)))
+    let diff = std::array::from_fn(|y| _mm256_sub_epi16(load(src, 4, y), load(reference, pitch, y)));
+    horizontal_sum(_mm256_madd_epi16(tile_maxima(diff), _mm256_set1_epi32(1)))
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -1517,5 +1671,221 @@ mod simd128 {
             }
         }
         total(i32x4_add(wide, u32x4_extadd_pairwise_u16x8(acc)))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code, clippy::many_single_char_names)]
+mod neon {
+    use core::arch::aarch64::{
+        int16x8_t, uint16x4_t, vabd_u8, vabdq_u8, vabsq_s16, vadd_u16, vaddlv_u16, vaddlvq_u8,
+        vaddq_s16, vaddvq_u32, vcombine_s16, vdup_n_u16, vdup_n_u32, vdupq_n_u16, vdupq_n_u32,
+        vget_low_s16, vld1_u8, vld1q_u8, vmaxq_s16, vpadal_u8, vpadalq_u8, vpadalq_u16,
+        vreinterpret_u8_u32, vreinterpret_u16_s16, vreinterpretq_s16_u16, vreinterpretq_u8_u32,
+        vset_lane_u32, vsetq_lane_u32, vsubl_u8, vsubq_s16, vuzp1q_s16, vuzp2q_s16,
+    };
+
+    fn span(width: usize, height: usize, pitch: usize) -> usize {
+        (height - 1) * pitch + width
+    }
+
+    pub(super) fn contiguous_sum(block: &[u8]) -> u32 {
+        unsafe {
+            let mut acc32 = vdupq_n_u32(0);
+            let mut acc16 = vdupq_n_u16(0);
+            for (index, chunk) in block.as_chunks::<16>().0.iter().enumerate() {
+                acc16 = vpadalq_u8(acc16, vld1q_u8(chunk.as_ptr()));
+                if index & 31 == 31 {
+                    acc32 = vpadalq_u16(acc32, acc16);
+                    acc16 = vdupq_n_u16(0);
+                }
+            }
+            vaddvq_u32(vpadalq_u16(acc32, acc16))
+        }
+    }
+
+    pub(super) fn sad(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        unsafe {
+            if width == 4 && height == 4 {
+                let load_block = |base: *const u8, pitch: usize| {
+                    let load_row = |row| base.add(row * pitch).cast::<u32>().read_unaligned();
+                    let lanes = vdupq_n_u32(load_row(0));
+                    let lanes = vsetq_lane_u32::<1>(load_row(1), lanes);
+                    let lanes = vsetq_lane_u32::<2>(load_row(2), lanes);
+                    let lanes = vsetq_lane_u32::<3>(load_row(3), lanes);
+                    vreinterpretq_u8_u32(lanes)
+                };
+                return u32::from(vaddlvq_u8(vabdq_u8(load_block(s, sp), load_block(r, rp))));
+            }
+            if width == 8 {
+                let mut acc = vdup_n_u16(0);
+                for y in 0..height {
+                    let a = vld1_u8(s.add(y * sp));
+                    let b = vld1_u8(r.add(y * rp));
+                    acc = vpadal_u8(acc, vabd_u8(a, b));
+                }
+                return vaddlv_u16(acc);
+            }
+            if width >= 16 {
+                let mut acc = vdupq_n_u16(0);
+                let mut wide = vdupq_n_u32(0);
+                for y in 0..height {
+                    let mut x = 0;
+                    while x + 16 <= width {
+                        let a = vld1q_u8(s.add(y * sp + x));
+                        let b = vld1q_u8(r.add(y * rp + x));
+                        acc = vpadalq_u8(acc, vabdq_u8(a, b));
+                        x += 16;
+                    }
+                    if y & 31 == 31 {
+                        wide = vpadalq_u16(wide, acc);
+                        acc = vdupq_n_u16(0);
+                    }
+                }
+                return vaddvq_u32(vpadalq_u16(wide, acc));
+            }
+            let mut total = 0u32;
+            for y in 0..height {
+                for x in 0..width {
+                    total += u32::from((*s.add(y * sp + x)).abs_diff(*r.add(y * rp + x)));
+                }
+            }
+            total
+        }
+    }
+
+    #[inline]
+    unsafe fn row8(src: *const u8, reference: *const u8) -> int16x8_t {
+        unsafe { vreinterpretq_s16_u16(vsubl_u8(vld1_u8(src), vld1_u8(reference))) }
+    }
+
+    #[inline]
+    unsafe fn horizontal_max(v: int16x8_t) -> uint16x4_t {
+        unsafe {
+            let even = vuzp1q_s16(v, v);
+            let odd = vuzp2q_s16(v, v);
+            let sums = vaddq_s16(even, odd);
+            let diffs = vsubq_s16(even, odd);
+            let au = vabsq_s16(vcombine_s16(vget_low_s16(sums), vget_low_s16(diffs)));
+            let e2 = vuzp1q_s16(au, au);
+            let o2 = vuzp2q_s16(au, au);
+            vreinterpret_u16_s16(vget_low_s16(vmaxq_s16(e2, o2)))
+        }
+    }
+
+    pub(super) fn satd(
+        src: &[u8],
+        sp: usize,
+        reference: &[u8],
+        rp: usize,
+        width: usize,
+        height: usize,
+    ) -> u32 {
+        assert!(src.len() >= span(width, height, sp) && reference.len() >= span(width, height, rp));
+        let (s, r) = (src.as_ptr(), reference.as_ptr());
+        unsafe {
+            let mut total = 0u32;
+            if width == 4 {
+                let zero = vdup_n_u32(0);
+                for ty in (0..height).step_by(4) {
+                    let d: [int16x8_t; 4] = std::array::from_fn(|k| {
+                        let load_row = |base: *const u8, pitch: usize| {
+                            let row = base.add((ty + k) * pitch).cast::<u32>().read_unaligned();
+                            vreinterpret_u8_u32(vset_lane_u32::<0>(row, zero))
+                        };
+                        vreinterpretq_s16_u16(vsubl_u8(load_row(s, sp), load_row(r, rp)))
+                    });
+                    let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
+                    let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
+                    let sum0 = vadd_u16(
+                        horizontal_max(vaddq_s16(a, b)),
+                        horizontal_max(vsubq_s16(a, b)),
+                    );
+                    let sum1 = vadd_u16(
+                        horizontal_max(vaddq_s16(c, e)),
+                        horizontal_max(vsubq_s16(c, e)),
+                    );
+                    total += vaddlv_u16(vadd_u16(sum0, sum1));
+                }
+                return total;
+            }
+            for ty in (0..height).step_by(4) {
+                for tx in (0..width).step_by(8) {
+                    let d: [int16x8_t; 4] = std::array::from_fn(|k| {
+                        row8(s.add((ty + k) * sp + tx), r.add((ty + k) * rp + tx))
+                    });
+                    let (a, b) = (vaddq_s16(d[0], d[1]), vaddq_s16(d[2], d[3]));
+                    let (c, e) = (vsubq_s16(d[0], d[1]), vsubq_s16(d[2], d[3]));
+                    let sum0 = vadd_u16(
+                        horizontal_max(vaddq_s16(a, b)),
+                        horizontal_max(vsubq_s16(a, b)),
+                    );
+                    let sum1 = vadd_u16(
+                        horizontal_max(vaddq_s16(c, e)),
+                        horizontal_max(vsubq_s16(c, e)),
+                    );
+                    total += vaddlv_u16(vadd_u16(sum0, sum1));
+                }
+            }
+            total
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::{Shape, luma_kernel, sad_scalar, satd_scalar};
+
+    #[test]
+    fn neon_4x4_costs_accept_unaligned_rows() {
+        let shape = Shape::new(4, 4);
+        let (width, height) = (shape.width, shape.height);
+        let sad = luma_kernel(shape, false);
+        let satd = luma_kernel(shape, true);
+        let mut state = 73u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        };
+        for pitch in [0, width - 1, width, width + 1, width + 13, 1920] {
+            for offset in 0..16 {
+                let mut src: Vec<u8> = (0..shape.area() + offset).map(|_| next()).collect();
+                let mut reference: Vec<u8> = (0..shape.span(pitch) + 15 - offset)
+                    .map(|_| next())
+                    .collect();
+                let src = &mut src[offset..];
+                let reference = &mut reference[15 - offset..];
+                let check = |src: &[u8], reference: &[u8]| {
+                    assert_eq!(
+                        sad(src, reference, pitch),
+                        sad_scalar(src, reference, pitch, width, height),
+                        "SAD pitch {pitch}, offset {offset}"
+                    );
+                    assert_eq!(
+                        satd(src, reference, pitch),
+                        satd_scalar(src, width, reference, pitch, width, height),
+                        "SATD pitch {pitch}, offset {offset}"
+                    );
+                };
+                check(src, reference);
+                src.fill(0);
+                reference.fill(u8::MAX);
+                check(src, reference);
+                src.fill(u8::MAX);
+                reference.fill(0);
+                check(src, reference);
+            }
+        }
     }
 }

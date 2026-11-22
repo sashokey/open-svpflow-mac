@@ -43,7 +43,11 @@
 #define P_MODE 33
 #define P_BLUR 34
 
-#if defined(__NV_CL_C_VERSION) && !defined(NO_NV_ASM)
+#if defined(__NV_CL_C_VERSION) && !defined(NO_NV_ASM) && !defined(NO_NV)
+#define NV 1
+#endif
+
+#ifdef NV
 #define BPW 2
 inline uint sad4(uint a, uint b, uint c) {
     uint r;
@@ -53,6 +57,26 @@ inline uint sad4(uint a, uint b, uint c) {
 inline uint funnel(uint lo, uint hi, uint sft) {
     uint r;
     asm("shf.r.wrap.b32 %0,%1,%2,%3;" : "=r"(r) : "r"(lo), "r"(hi), "r"(sft));
+    return r;
+}
+inline uint ldg_u8(__global const uchar *p) {
+    uint r;
+    asm("ld.global.nc.u8 %0,[%1];" : "=r"(r) : "l"(p));
+    return r;
+}
+inline uint ldg_u32(__global const uint *p) {
+    uint r;
+    asm("ld.global.nc.u32 %0,[%1];" : "=r"(r) : "l"(p));
+    return r;
+}
+inline uint2 ldg_u32x2(__global const uint2 *p) {
+    uint2 r;
+    asm("ld.global.nc.v2.u32 {%0,%1},[%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+}
+inline uint4 ldg_u32x4(__global const uint4 *p) {
+    uint4 r;
+    asm("ld.global.nc.v4.u32 {%0,%1,%2,%3},[%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
     return r;
 }
 inline void wsync(void) { asm volatile("bar.warp.sync 0xffffffff;" ::: "memory"); }
@@ -97,15 +121,103 @@ inline int wmin(int v, __local uint *s) {
     return r;
 }
 #endif
+#elif defined(USE_SUBGROUPS)
+#ifdef USE_KHR_SUBGROUPS
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#endif
+#ifdef USE_KHR_SHUFFLE
+#pragma OPENCL EXTENSION cl_khr_subgroup_shuffle : enable
+#endif
+#ifdef USE_SUBGROUP_BALLOT
+#pragma OPENCL EXTENSION cl_khr_subgroup_ballot : enable
+#endif
+#ifdef INTEL_GPU
+#pragma OPENCL EXTENSION cl_intel_subgroups : enable
+#endif
+#ifdef INTEL_REQD_SG32
+#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
+#endif
+#ifdef SUBGROUP_BPW
+#define BPW SUBGROUP_BPW
 #else
-#define BPW 1
+#define BPW 2
+#endif
+#if defined(AMD_GCN) && defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_sad_u8)
+#define HAS_AMD_SAD_U8 1
+#endif
+#endif
 inline uint sad4(uint a, uint b, uint c) {
+#ifdef HAS_AMD_SAD_U8
+    return __builtin_amdgcn_sad_u8(a, b, c);
+#else
     uchar4 d = abs_diff(as_uchar4(a), as_uchar4(b));
     return c + d.x + d.y + d.z + d.w;
+#endif
 }
 inline uint funnel(uint lo, uint hi, uint sft) {
     return sft ? (lo >> sft) | (hi << (32 - sft)) : lo;
 }
+inline uint ldg_u8(__global const uchar *p) { return (uint)(*p); }
+inline uint ldg_u32(__global const uint *p) { return *p; }
+inline uint2 ldg_u32x2(__global const uint2 *p) { return *p; }
+inline uint4 ldg_u32x4(__global const uint4 *p) { return *p; }
+inline void wsync(void) { sub_group_barrier(CLK_LOCAL_MEM_FENCE); }
+inline uint shfl_i(uint v, uint i, __local uint *s) {
+#ifdef USE_KHR_SHUFFLE
+    return sub_group_shuffle(v, i);
+#else
+    return intel_sub_group_shuffle(v, i);
+#endif
+}
+inline uint shfl_x(uint v, uint m, __local uint *s) {
+#ifdef USE_KHR_SHUFFLE
+    return sub_group_shuffle_xor(v, m);
+#else
+    return intel_sub_group_shuffle_xor(v, m);
+#endif
+}
+inline uint ballot(bool p, __local uint *s) {
+#ifdef USE_SUBGROUP_BALLOT
+    return sub_group_ballot(p).x;
+#else
+    uint l = (uint)get_local_id(0) & 31u;
+    return sub_group_reduce_add(p ? (1u << l) : 0u);
+#endif
+}
+inline uint match_any(uint v, __local uint *s) {
+    uint r = 0;
+    #pragma unroll
+    for (uint i = 0; i < 32; i++) {
+        uint b = sub_group_broadcast(v, i);
+        r |= (b == v ? 1u : 0u) << i;
+    }
+    return r;
+}
+inline uint radd(uint v, __local uint *s) { return sub_group_reduce_add(v); }
+inline int wmin(int v, __local uint *s) { return sub_group_reduce_min(v); }
+#else
+#define BPW 1
+#if defined(AMD_GCN) && defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_sad_u8)
+#define HAS_AMD_SAD_U8 1
+#endif
+#endif
+inline uint sad4(uint a, uint b, uint c) {
+#ifdef HAS_AMD_SAD_U8
+    return __builtin_amdgcn_sad_u8(a, b, c);
+#else
+    uchar4 d = abs_diff(as_uchar4(a), as_uchar4(b));
+    return c + d.x + d.y + d.z + d.w;
+#endif
+}
+inline uint funnel(uint lo, uint hi, uint sft) {
+    return sft ? (lo >> sft) | (hi << (32 - sft)) : lo;
+}
+inline uint ldg_u8(__global const uchar *p) { return (uint)(*p); }
+inline uint ldg_u32(__global const uint *p) { return *p; }
+inline uint2 ldg_u32x2(__global const uint2 *p) { return *p; }
+inline uint4 ldg_u32x4(__global const uint4 *p) { return *p; }
 inline void wsync(void) { barrier(CLK_LOCAL_MEM_FENCE); }
 inline uint shfl_i(uint v, uint i, __local uint *s) {
     uint l = get_local_id(0) & 31;
@@ -147,6 +259,11 @@ inline int wmin(int v, __local uint *s) {
 }
 #endif
 #define WGS (32 * BPW)
+#if defined(INTEL_GPU) && defined(USE_SUBGROUPS) && defined(INTEL_REQD_SG32)
+#define SEARCH_ATTR __attribute__((reqd_work_group_size(WGS, 1, 1), intel_reqd_sub_group_size(32)))
+#else
+#define SEARCH_ATTR __attribute__((reqd_work_group_size(WGS, 1, 1)))
+#endif
 #define MDIR_SETUP \
     const int mgid = (int)get_group_id(0); \
     const int mdv = mgid >= mdir.s0; \
@@ -273,21 +390,32 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
     uint sb = (uint)q[P_SBY] + (uint)s->py * (uint)q[P_SPY] + (uint)s->px;
     uint acc = 0;
     #pragma unroll 1
+#ifdef STRIDE_SAD
+    for (int j = 0; j < H; j += 2) {
+#else
     for (int j = 0; j < H; j++) {
+#endif
         uint so = sb + (uint)j * (uint)q[P_SPY], ro = off + (uint)j * rp;
         __global const uint *sw = (__global const uint *)(gy + (so & ~3u));
         __global const uint *rw = (__global const uint *)(ry + (ro & ~3u));
         uint ss_ = (so & 3u) * 8u, rs_ = (ro & 3u) * 8u;
-        uint sp_ = sw[0], rpv = rw[0];
+        uint sp_ = ldg_u32(sw), rpv = ldg_u32(rw);
         #pragma unroll
         for (int i = 0; i < W / 4; i++) {
-            uint sn = sw[i + 1], rn = rw[i + 1];
+            uint sn = ldg_u32(sw + i + 1), rn = ldg_u32(rw + i + 1);
             acc = sad4(funnel(sp_, sn, ss_), funnel(rpv, rn, rs_), acc);
             sp_ = sn;
             rpv = rn;
         }
     }
+#ifdef STRIDE_SAD
+    *luma = (int)(acc << 1);
+#else
     *luma = (int)acc;
+#endif
+#ifdef NO_CHROMA
+    *chroma = 0;
+#else
     uint coff = (uint)subpel(q[P_RBU], cp, q[P_RHU], pel, s->cpx * pel + (vx >> CS), s->cpy * pel + (vy >> CS));
     uint cb = (uint)q[P_SBU] + (uint)s->cpy * (uint)q[P_SPU] + (uint)s->cpx;
     uint cacc = 0;
@@ -300,16 +428,17 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
         __global const uint *vw = (__global const uint *)(gv + sa);
         __global const uint *ruw = (__global const uint *)(ru + ra);
         __global const uint *rvw = (__global const uint *)(rv + ra);
-        uint up = uw[0], vp = vw[0], rup = ruw[0], rvp = rvw[0];
+        uint up = ldg_u32(uw), vp = ldg_u32(vw), rup = ldg_u32(ruw), rvp = ldg_u32(rvw);
         #pragma unroll
         for (int i = 0; i < CW / 4; i++) {
-            uint un = uw[i + 1], vn = vw[i + 1], run = ruw[i + 1], rvn = rvw[i + 1];
+            uint un = ldg_u32(uw + i + 1), vn = ldg_u32(vw + i + 1), run = ldg_u32(ruw + i + 1), rvn = ldg_u32(rvw + i + 1);
             cacc = sad4(funnel(up, un, ss_), funnel(rup, run, rs_), cacc);
             cacc = sad4(funnel(vp, vn, ss_), funnel(rvp, rvn, rs_), cacc);
             up = un; vp = vn; rup = run; rvp = rvn;
         }
     }
     *chroma = (int)cacc << CSH;
+#endif
 }
 
 #ifdef SATD
@@ -322,7 +451,7 @@ inline void sad_slow(__global const uchar *gy, __global const uchar *gu, __globa
 #define TCOL(t, r) ((t) % (W / 4))
 #define TPIX(t, y, x) ((((t) / (W / 4)) * 4 + (y)) * W + ((t) % (W / 4)) * 4 + (x))
 #endif
-inline int had4x4(int *d) {
+inline int had4x4_half(int *d) {
     int t[16];
     #pragma unroll
     for (int y = 0; y < 4; y++) {
@@ -334,9 +463,21 @@ inline int had4x4(int *d) {
     #pragma unroll
     for (int x = 0; x < 4; x++) {
         int s0 = t[x] + t[4 + x], s1 = t[8 + x] + t[12 + x], d0 = t[x] - t[4 + x], d1 = t[8 + x] - t[12 + x];
-        sum += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
+        sum += max(abs(s0), abs(s1)) + max(abs(d0), abs(d1));
     }
     return sum;
+}
+inline uint had4x4_half_u32(uint s0, uint s1, uint s2, uint s3, uint r0, uint r1, uint r2, uint r3) {
+    int d[16];
+    int4 d0 = convert_int4(as_uchar4(s0)) - convert_int4(as_uchar4(r0));
+    int4 d1 = convert_int4(as_uchar4(s1)) - convert_int4(as_uchar4(r1));
+    int4 d2 = convert_int4(as_uchar4(s2)) - convert_int4(as_uchar4(r2));
+    int4 d3 = convert_int4(as_uchar4(s3)) - convert_int4(as_uchar4(r3));
+    d[0] = d0.x; d[1] = d0.y; d[2] = d0.z; d[3] = d0.w;
+    d[4] = d1.x; d[5] = d1.y; d[6] = d1.z; d[7] = d1.w;
+    d[8] = d2.x; d[9] = d2.y; d[10] = d2.z; d[11] = d2.w;
+    d[12] = d3.x; d[13] = d3.y; d[14] = d3.z; d[15] = d3.w;
+    return (uint)had4x4_half(d);
 }
 
 inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global const uchar *gv,
@@ -355,11 +496,14 @@ inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global
             for (int x = 0; x < 4; x++) {
                 int pix = TPIX(t, y, x);
                 int py = pix / W, px = pix % W;
-                d[y * 4 + x] = (int)gy[sb + py * sp + px] - (int)ry[off + py * rp + px];
+                d[y * 4 + x] = (int)ldg_u8(gy + sb + py * sp + px) - (int)ldg_u8(ry + off + py * rp + px);
             }
-        total += had4x4(d) / 2;
+        total += had4x4_half(d);
     }
     *luma = total;
+#ifdef NO_CHROMA
+    *chroma = 0;
+#else
     long coff = subpel(q[P_RBU], cp, q[P_RHU], pel, s->cpx * pel + (vx >> CS), s->cpy * pel + (vy >> CS));
     long cs = q[P_SBU] + (long)s->cpy * q[P_SPU] + s->cpx;
     long csp = q[P_SPU];
@@ -373,13 +517,14 @@ inline void satd_at(__global const uchar *gy, __global const uchar *gu, __global
                 for (int x = 0; x < 4; x++) {
                     long so = cs + (ty + y) * csp + tx + x;
                     long ro = coff + (ty + y) * cp + tx + x;
-                    du[y * 4 + x] = (int)gu[so] - (int)ru[ro];
-                    dv[y * 4 + x] = (int)gv[so] - (int)rv[ro];
+                    du[y * 4 + x] = (int)ldg_u8(gu + so) - (int)ldg_u8(ru + ro);
+                    dv[y * 4 + x] = (int)ldg_u8(gv + so) - (int)ldg_u8(rv + ro);
                 }
-            tu += had4x4(du) / 2;
-            tv += had4x4(dv) / 2;
+            tu += had4x4_half(du);
+            tv += had4x4_half(dv);
         }
     *chroma = (tu + tv) << CSH;
+#endif
 }
 #endif
 
@@ -431,7 +576,7 @@ inline void stage(__local uint4 *dst, int stride4, __global const uchar *buf, ui
         int row = (int)mul_hi((uint)j, m);
         int ch = j - row * nch;
         uint a = ((off0 + (uint)row * pitch) & ~15u) + 16u * (uint)ch;
-        dst[row * stride4 + ch] = *(__global const uint4 *)(buf + a);
+        dst[row * stride4 + ch] = ldg_u32x4((__global const uint4 *)(buf + a));
     }
 }
 
@@ -446,7 +591,7 @@ inline void stage2(__local uint4 *dst, int stride4, int plane4, __global const u
         int ch = jj - row * nch;
         uint a = ((off0 + (uint)row * pitch) & ~15u) + 16u * (uint)ch;
         __global const uchar *buf = p ? b1 : b0;
-        dst[p * plane4 + row * stride4 + ch] = *(__global const uint4 *)(buf + a);
+        dst[p * plane4 + row * stride4 + ch] = ldg_u32x4((__global const uint4 *)(buf + a));
     }
 }
 
@@ -461,38 +606,36 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
     for (uint i = 0; i < (TL + G - 1) / G; i++) {
         uint t = g + i * G;
         if (t < TL) {
-            int d[16];
+            uint sw[4], rw[4];
             #pragma unroll
             for (int r = 0; r < 4; r++) {
                 __local const uint *w = stl + (TROW(t, r) + lrow) * RSL + wc + TCOL(t, r);
-                uint rw = funnel(w[0], w[1], sl);
-                uint sw = ss[TROW(t, r) * (W / 4) + TCOL(t, r)];
-                int4 dd = convert_int4(as_uchar4(sw)) - convert_int4(as_uchar4(rw));
-                d[r * 4] = dd.x; d[r * 4 + 1] = dd.y; d[r * 4 + 2] = dd.z; d[r * 4 + 3] = dd.w;
+                rw[r] = funnel(w[0], w[1], sl);
+                sw[r] = ss[TROW(t, r) * (W / 4) + TCOL(t, r)];
             }
-            a += (uint)(had4x4(d) / 2);
+            a += had4x4_half_u32(sw[0], sw[1], sw[2], sw[3], rw[0], rw[1], rw[2], rw[3]);
         }
     }
-    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     uint b = 0;
+#ifndef NO_CHROMA
+    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     #pragma unroll 1
     for (uint i = 0; i < (2 * TC + G - 1) / G; i++) {
         uint t = g + i * G;
         if (t < 2 * TC) {
             uint p = t / TC, idx = t % TC;
             uint ty = idx / (CW / 4), tx = idx % (CW / 4);
-            int d[16];
+            uint sw[4], rw[4];
             #pragma unroll
             for (int r = 0; r < 4; r++) {
                 __local const uint *w = stc + p * (ROWSC * RSC) + (ty * 4 + r + crow) * RSC + cc + tx;
-                uint rw = funnel(w[0], w[1], sc);
-                uint sw = ss[CB + p * (CAREA / 4) + (ty * 4 + r) * (CW / 4) + tx];
-                int4 dd = convert_int4(as_uchar4(sw)) - convert_int4(as_uchar4(rw));
-                d[r * 4] = dd.x; d[r * 4 + 1] = dd.y; d[r * 4 + 2] = dd.z; d[r * 4 + 3] = dd.w;
+                rw[r] = funnel(w[0], w[1], sc);
+                sw[r] = ss[CB + p * (CAREA / 4) + (ty * 4 + r) * (CW / 4) + tx];
             }
-            b += (uint)(had4x4(d) / 2);
+            b += had4x4_half_u32(sw[0], sw[1], sw[2], sw[3], rw[0], rw[1], rw[2], rw[3]);
         }
     }
+#endif
     *accL = a;
     *accC = b;
 }
@@ -502,6 +645,21 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
                   uint g, const uint G, int lrow, uint lcol, int crow, uint ccol, uint *accL, uint *accC) {
     uint sl = (lcol & 3) * 8, wc = lcol >> 2;
     uint a = 0;
+#ifdef STRIDE_SAD
+    #pragma unroll 4
+    for (uint i = 0; i < (LT / 2 + G - 1) / G; i++) {
+        uint t = g + i * G;
+        if (t < LT / 2) {
+            uint row = 2u * (t / LTR), grp = t % LTR;
+            uint st = row * LTR + grp;
+            __local const uint *w = stl + (row + lrow) * RSL + wc + grp * 2;
+            uint a0 = w[0], a1 = w[1], a2 = w[2];
+            a = sad4(ss[2 * st], funnel(a0, a1, sl), a);
+            a = sad4(ss[2 * st + 1], funnel(a1, a2, sl), a);
+        }
+    }
+    a <<= 1;
+#else
     #pragma unroll 4
     for (uint i = 0; i < (LT + G - 1) / G; i++) {
         uint t = g + i * G;
@@ -513,8 +671,10 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             a = sad4(ss[2 * t + 1], funnel(a1, a2, sl), a);
         }
     }
-    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
+#endif
     uint b = 0;
+#ifndef NO_CHROMA
+    uint sc = (ccol & 3) * 8, cc = ccol >> 2;
     #pragma unroll 4
     for (uint i = 0; i < (CT + G - 1) / G; i++) {
         uint t = g + i * G;
@@ -527,6 +687,7 @@ inline __attribute__((always_inline)) void tasks(__local const uint *ss, __local
             if (CTW == 2) b = sad4(ss[CB + t * CTW + 1], funnel(a1, w[2], sc), b);
         }
     }
+#endif
     *accL = a;
     *accC = b;
 }
@@ -541,12 +702,18 @@ inline void cand_sad(__global const uchar *ry, __global const uchar *ru, __globa
     uint coff0 = (uint)subpel(q[P_RBU], q[P_RPU], q[P_RHU], pel, (x0 >> CS) * pel + (vx >> CS), (y0 >> CS) * pel + (vy >> CS));
     wsync();
     stage(stl, NCHL, ry, off0, (uint)q[P_RPY], H, (W + 30) / 16, l);
+#ifndef NO_CHROMA
     stage2(stc, NCHC, ROWSC * NCHC, ru, rv, coff0, (uint)q[P_RPU], CH, (CW + 30) / 16, l);
+#endif
     wsync();
     uint al, ac;
     tasks(ss, (__local const uint *)stl, (__local const uint *)stc, l, 32, 0, off0 & 15u, 0, coff0 & 15u, &al, &ac);
     *sl = (int)radd(al, scr);
+#ifdef NO_CHROMA
+    *sc = 0;
+#else
     *sc = (int)radd(ac, scr) << CSH;
+#endif
 }
 
 #ifdef LANEG
@@ -560,16 +727,14 @@ inline void cand_sad(__global const uchar *ry, __global const uchar *ru, __globa
 
 #ifdef SATD
 inline uint tile_had(__global const uchar *rb, uint o0, uint pitch, const uint *sr) {
-    int d[16];
+    uint rw[4];
     #pragma unroll
     for (int rr = 0; rr < 4; rr++) {
         uint o = o0 + (uint)rr * pitch;
         __global const uint *pw = (__global const uint *)(rb + (o & ~3u));
-        uint rw = funnel(pw[0], pw[1], (o & 3u) * 8u);
-        int4 dd = convert_int4(as_uchar4(sr[rr])) - convert_int4(as_uchar4(rw));
-        d[rr * 4] = dd.x; d[rr * 4 + 1] = dd.y; d[rr * 4 + 2] = dd.z; d[rr * 4 + 3] = dd.w;
+        rw[rr] = funnel(ldg_u32(pw), ldg_u32(pw + 1), (o & 3u) * 8u);
     }
-    return (uint)(had4x4(d) / 2);
+    return had4x4_half_u32(sr[0], sr[1], sr[2], sr[3], rw[0], rw[1], rw[2], rw[3]);
 }
 
 inline void tile_load(__global const uchar *sb, uint o0, uint pitch, uint *sr) {
@@ -577,7 +742,7 @@ inline void tile_load(__global const uchar *sb, uint o0, uint pitch, uint *sr) {
     for (int rr = 0; rr < 4; rr++) {
         uint o = o0 + (uint)rr * pitch;
         __global const uint *pw = (__global const uint *)(sb + (o & ~3u));
-        sr[rr] = funnel(pw[0], pw[1], (o & 3u) * 8u);
+        sr[rr] = funnel(ldg_u32(pw), ldg_u32(pw + 1), (o & 3u) * 8u);
     }
 }
 #endif
@@ -590,29 +755,50 @@ inline uint2 grp_part(__global const uchar *ry, __global const uchar *ru, __glob
 #if defined(SATD) && CS == 0
     uint t = r & 3u;
     uint th = r < 4 ? tile_had(ry, off0 + (t >> 1) * 4u * rp + (t & 1u) * 4u, rp, sr) : 0u;
+#ifdef NO_CHROMA
+    uint tc = 0u;
+#else
     uint tc = tile_had((r & 4u) ? rv : ru, coff0 + (t >> 1) * 4u * cp + (t & 1u) * 4u, cp, sr + 4);
+#endif
     return (uint2)(th, tc);
 #elif defined(SATD)
     bool lum = r < 4;
+#ifdef NO_CHROMA
+    uint th = lum ? tile_had(ry, off0 + (r >> 1) * 4u * rp + (r & 1u) * 4u, rp, sr) : 0u;
+    return (uint2)(th, 0u);
+#else
     uint o0 = lum ? off0 + (r >> 1) * 4u * rp + (r & 1u) * 4u : coff0;
     uint th = tile_had(lum ? ry : (r & 1u) ? rv : ru, o0, lum ? rp : cp, sr);
     return (uint2)(lum ? th : 0u, (r == 4u || r == 5u) ? th : 0u);
+#endif
+#else
+#ifdef STRIDE_SAD
+    uint al = 0u;
+    if ((r & 1u) == 0u) {
+        uint o = off0 + r * rp;
+        __global const uint *p = (__global const uint *)(ry + (o & ~3u));
+        uint sh = (o & 3u) * 8u, c0 = ldg_u32(p), c1 = ldg_u32(p + 1), c2 = ldg_u32(p + 2);
+        al = sad4(sr[1], funnel(c1, c2, sh), sad4(sr[0], funnel(c0, c1, sh), 0u)) << 1;
+    }
 #else
     uint o = off0 + r * rp;
     __global const uint *p = (__global const uint *)(ry + (o & ~3u));
-    uint sh = (o & 3u) * 8u, c0 = p[0], c1 = p[1], c2 = p[2];
+    uint sh = (o & 3u) * 8u, c0 = ldg_u32(p), c1 = ldg_u32(p + 1), c2 = ldg_u32(p + 2);
     uint al = sad4(sr[1], funnel(c1, c2, sh), sad4(sr[0], funnel(c0, c1, sh), 0u));
-#if CS == 0
+#endif
+#ifdef NO_CHROMA
+    uint ac = 0u;
+#elif CS == 0
     uint co = coff0 + r * cp, cs = (co & 3u) * 8u;
     __global const uint *pu = (__global const uint *)(ru + (co & ~3u));
     __global const uint *pv = (__global const uint *)(rv + (co & ~3u));
-    uint u0 = pu[0], u1 = pu[1], v0 = pv[0], v1 = pv[1];
-    uint ac = sad4(sr[3], funnel(u1, pu[2], cs), sad4(sr[2], funnel(u0, u1, cs), 0u));
-    ac = sad4(sr[5], funnel(v1, pv[2], cs), sad4(sr[4], funnel(v0, v1, cs), ac));
+    uint u0 = ldg_u32(pu), u1 = ldg_u32(pu + 1), v0 = ldg_u32(pv), v1 = ldg_u32(pv + 1);
+    uint ac = sad4(sr[3], funnel(u1, ldg_u32(pu + 2), cs), sad4(sr[2], funnel(u0, u1, cs), 0u));
+    ac = sad4(sr[5], funnel(v1, ldg_u32(pv + 2), cs), sad4(sr[4], funnel(v0, v1, cs), ac));
 #else
     uint co = coff0 + (r & 3u) * cp;
     __global const uint *pc = (__global const uint *)(((r & 4u) ? rv : ru) + (co & ~3u));
-    uint ac = sad4(sr[2], funnel(pc[0], pc[1], (co & 3u) * 8u), 0u);
+    uint ac = sad4(sr[2], funnel(ldg_u32(pc), ldg_u32(pc + 1), (co & 3u) * 8u), 0u);
 #endif
     return (uint2)(al | (ac << 16), 0u);
 #endif
@@ -657,33 +843,48 @@ inline uint grp_src(__global const uchar *sy, __global const uchar *su, __global
     uint t = r & 3u;
     if (lum) tile_load(sy, (uint)q[P_SBY] + (uint)(y0 + (int)(t >> 1) * 4) * spy + (uint)x0 + (t & 1u) * 4u, spy, sr);
     else sr[0] = sr[1] = sr[2] = sr[3] = 0;
+#ifdef NO_CHROMA
+    sr[4] = sr[5] = sr[6] = sr[7] = 0;
+#else
     tile_load((r & 4u) ? sv : su, (uint)q[P_SBU] + (uint)(y0 + (int)(t >> 1) * 4) * spu + (uint)x0 + (t & 1u) * 4u, spu, sr + 4);
+#endif
     return lum ? sad4(sr[3], 0u, sad4(sr[2], 0u, sad4(sr[1], 0u, sad4(sr[0], 0u, 0u)))) : 0u;
 #elif defined(SATD)
     bool lum = r < 4;
+#ifdef NO_CHROMA
+    if (lum) tile_load(sy, (uint)q[P_SBY] + (uint)(y0 + (int)(r >> 1) * 4) * spy + (uint)x0 + (r & 1u) * 4u, spy, sr);
+    else sr[0] = sr[1] = sr[2] = sr[3] = 0;
+#else
     uint o0 = lum ? (uint)q[P_SBY] + (uint)(y0 + (int)(r >> 1) * 4) * spy + (uint)x0 + (r & 1u) * 4u
                   : (uint)q[P_SBU] + (uint)(y0 >> 1) * spu + (uint)(x0 >> 1);
     tile_load(lum ? sy : (r & 1u) ? sv : su, o0, lum ? spy : spu, sr);
+#endif
     return lum ? sad4(sr[3], 0u, sad4(sr[2], 0u, sad4(sr[1], 0u, sad4(sr[0], 0u, 0u)))) : 0u;
 #else
     uint so = (uint)q[P_SBY] + (uint)(y0 + (int)r) * spy + (uint)x0;
     __global const uint *p = (__global const uint *)(sy + (so & ~3u));
-    uint sh = (so & 3u) * 8u, c0 = p[0], c1 = p[1], c2 = p[2];
+    uint sh = (so & 3u) * 8u, c0 = ldg_u32(p), c1 = ldg_u32(p + 1), c2 = ldg_u32(p + 2);
     sr[0] = funnel(c0, c1, sh);
     sr[1] = funnel(c1, c2, sh);
+#ifdef NO_CHROMA
 #if CS == 0
+    sr[2] = sr[3] = sr[4] = sr[5] = 0;
+#else
+    sr[2] = sr[3] = 0;
+#endif
+#elif CS == 0
     uint co = (uint)q[P_SBU] + (uint)(y0 + (int)r) * spu + (uint)x0, cs = (co & 3u) * 8u;
     __global const uint *pu = (__global const uint *)(su + (co & ~3u));
     __global const uint *pv = (__global const uint *)(sv + (co & ~3u));
-    uint u1 = pu[1], v1 = pv[1];
-    sr[2] = funnel(pu[0], u1, cs);
-    sr[3] = funnel(u1, pu[2], cs);
-    sr[4] = funnel(pv[0], v1, cs);
-    sr[5] = funnel(v1, pv[2], cs);
+    uint u1 = ldg_u32(pu + 1), v1 = ldg_u32(pv + 1);
+    sr[2] = funnel(ldg_u32(pu), u1, cs);
+    sr[3] = funnel(u1, ldg_u32(pu + 2), cs);
+    sr[4] = funnel(ldg_u32(pv), v1, cs);
+    sr[5] = funnel(v1, ldg_u32(pv + 2), cs);
 #else
     uint co = (uint)q[P_SBU] + (uint)((y0 >> 1) + (int)(r & 3u)) * spu + (uint)(x0 >> 1);
     __global const uint *pc = (__global const uint *)(((r & 4u) ? sv : su) + (co & ~3u));
-    sr[2] = funnel(pc[0], pc[1], (co & 3u) * 8u);
+    sr[2] = funnel(ldg_u32(pc), ldg_u32(pc + 1), (co & 3u) * 8u);
     sr[3] = 0;
 #endif
     return sad4(sr[1], 0u, sad4(sr[0], 0u, 0u));
@@ -836,12 +1037,20 @@ typedef struct {
 
 inline void batch_load(Batch *B, int s, __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
                        uint rh, uint cplane) {
-    B->vl[s] = *(__global const uint4 *)(ry + (B->offl[s] & ~15u) + 16u * rh);
-#if CS == 0
-    B->vu[s] = *(__global const uint4 *)(ru + (B->offc[s] & ~15u) + 16u * rh);
-    B->vv[s] = *(__global const uint4 *)(rv + (B->offc[s] & ~15u) + 16u * rh);
+#ifdef STRIDE_SAD
+    if ((get_local_id(0) & 2u) == 0u) {
+        B->vl[s] = ldg_u32x4((__global const uint4 *)(ry + (B->offl[s] & ~15u) + 16u * rh));
+    }
 #else
-    B->vc[s] = *(__global const uint2 *)((cplane ? rv : ru) + (B->offc[s] & ~7u) + 8u * rh);
+    B->vl[s] = ldg_u32x4((__global const uint4 *)(ry + (B->offl[s] & ~15u) + 16u * rh));
+#endif
+#ifndef NO_CHROMA
+#if CS == 0
+    B->vu[s] = ldg_u32x4((__global const uint4 *)(ru + (B->offc[s] & ~15u) + 16u * rh));
+    B->vv[s] = ldg_u32x4((__global const uint4 *)(rv + (B->offc[s] & ~15u) + 16u * rh));
+#else
+    B->vc[s] = ldg_u32x2((__global const uint2 *)((cplane ? rv : ru) + (B->offc[s] & ~7u) + 8u * rh));
+#endif
 #endif
 }
 
@@ -873,13 +1082,22 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, csrc scw, uint rh, __
     for (int s = 0; s < NSLOT; s++) {
         uint pl = 0, pc = 0;
         if (B->act[s]) {
+#ifdef STRIDE_SAD
+            uint2 g = glu(B->vl[s], B->offl[s], rh, scr);
+            if ((get_local_id(0) & 2u) == 0u) {
+                pl = sad4(s1, g.y, sad4(s0, g.x, 0)) << 1;
+            }
+#else
             uint2 g = glu(B->vl[s], B->offl[s], rh, scr);
             pl = sad4(s1, g.y, sad4(s0, g.x, 0));
+#endif
+#ifndef NO_CHROMA
 #if CS == 0
             uint2 gu = glu(B->vu[s], B->offc[s], rh, scr), gv = glu(B->vv[s], B->offc[s], rh, scr);
             pc = sad4(scw.w, gv.y, sad4(scw.z, gv.x, sad4(scw.y, gu.y, sad4(scw.x, gu.x, 0))));
 #else
             pc = sad4(scw, gcu(B->vc[s], B->offc[s], rh, scr), 0);
+#endif
 #endif
         }
         v[2 * s] = pl;
@@ -888,7 +1106,11 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, csrc scw, uint rh, __
     #pragma unroll
     for (int s = 0; s < NSLOT; s++) {
         rl[s] = (int)radd(v[2 * s], scr);
+#ifdef NO_CHROMA
+        rc[s] = 0;
+#else
         rc[s] = (int)radd(v[2 * s + 1], scr) << CSH;
+#endif
     }
 }
 
@@ -904,7 +1126,7 @@ inline void finish_batch(const Batch *B, uint s0, uint s1, csrc scw, uint rh, __
 #endif
 
 #if DONTV == 1 && defined(LANEG)
-__kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
+__kernel SEARCH_ATTR
 void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
             __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
             __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
@@ -942,7 +1164,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     const int vx = LO(pv.x), vy = HI(pv.x);
     const int omin_x = -pel * x0, omin_y = -pel * y0;
     const int omax_x = pel * (PW - x0 - W), omax_y = pel * (PH - y0 - H);
-    bool valid = act, shifted = false;
+    bool valid = act && pv.y >= 0, shifted = false;
     Sh t;
     if (!(vx >= omin_x && vx < omax_x && vy >= omin_y && vy < omax_y)) {
         t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);
@@ -967,7 +1189,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     }
 }
 #elif defined(LANEG)
-__kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
+__kernel SEARCH_ATTR
 void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
             __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
             __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
@@ -1215,18 +1437,12 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                     int i = (ty + y) * W + tx + x;
                     d[y * 4 + x] = (blur ? blurred(sy, i) : (int)sy[i]) - avg_c;
                 }
-            dl = had4x4(d) / 2;
+            dl = had4x4_half(d);
         }
 #if CS == 0
         {
-            int a_ = gr < 4 ? au : av;
-            int d[16];
-            #pragma unroll
-            for (int rr = 0; rr < 4; rr++) {
-                int4 dd = convert_int4(as_uchar4(sr[4 + rr])) - a_;
-                d[rr * 4] = dd.x; d[rr * 4 + 1] = dd.y; d[rr * 4 + 2] = dd.z; d[rr * 4 + 3] = dd.w;
-            }
-            int h = had4x4(d) / 2;
+            uint a4 = (uint)(gr < 4 ? au : av) * 0x01010101u;
+            int h = (int)had4x4_half_u32(sr[4], sr[5], sr[6], sr[7], a4, a4, a4, a4);
             if (gr < 4) du = h; else dv = h;
         }
 #else
@@ -1236,7 +1452,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
             int d[16];
             #pragma unroll
             for (int i = 0; i < 16; i++) d[i] = (int)sc_[i] - a_;
-            int h = had4x4(d) / 2;
+            int h = had4x4_half(d);
             if (gr == 4) du = h; else dv = h;
         }
 #endif
@@ -1256,9 +1472,13 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         }
 #endif
         dl = gsum(dl, scr);
+#ifdef NO_CHROMA
+        int contrast = min(dl * 2 / AREA, 255);
+#else
         du = gsum(du, scr);
         dv = gsum(dv, scr);
         int contrast = min(dl / AREA + du / CAREA + dv / CAREA, 255);
+#endif
         radius = contrast < 2 ? 0 : 1 + ((radius * min(contrast * 255 / 150, 255)) >> 8);
     }
     int cxp = LO(pv.x), cyp = HI(pv.x);
@@ -1267,7 +1487,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         const int x1 = (int)shfl_i((uint)vxA, gs + 1u, scr), y1 = (int)shfl_i((uint)vyA, gs + 1u, scr);
         if (pp1 != IMAX && pp1 < pp0) { cxp = x1; cyp = y1; }
     }
+#ifdef EARLY_EXIT
+    const bool do_ex = found && !(craw >= 0 && craw * 2 <= 3 * AREA);
+#else
     const bool do_ex = found;
+#endif
     int rst = 0;
     if (do_ex) {
         rst = min(radius, RMAX);
@@ -1317,7 +1541,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     }
 }
 #else
-__kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
+__kernel SEARCH_ATTR
 void search(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
             __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
             __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
@@ -1374,7 +1598,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         nvec = rin[ni].x;
         cn = cen[b];
         ax = aux[b];
+#ifdef EARLY_EXIT
+        if (!ballot(inb && nd != 0, scr) || (cn.y >= 0 && cn.y * 2 <= 3 * AREA)) {
+#else
         if (!ballot(inb && nd != 0, scr)) {
+#endif
             if (l == 0) {
                 rout[ob] = rin[ob];
                 dout[ob] = 0;
@@ -1400,14 +1628,22 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     const uint rrow = l >> 1, rh = l & 1, cplane = CS ? l >> 4 : 0, crow = CS ? (l >> 1) & 7 : rrow;
     const uint soffL = (uint)q[P_SBY] + (uint)(y0 + (int)rrow) * (uint)q[P_SPY] + (uint)x0;
     const uint soffC = (uint)q[P_SBU] + (uint)((y0 >> CS) + (int)crow) * (uint)q[P_SPU] + (uint)(x0 >> CS);
-    uint4 svl = *(__global const uint4 *)(sY + (soffL & ~15u) + 16u * rh);
+    uint4 svl = ldg_u32x4((__global const uint4 *)(sY + (soffL & ~15u) + 16u * rh));
 #if CS == 0
-    uint4 svu = *(__global const uint4 *)(sU + (soffC & ~15u) + 16u * rh);
-    uint4 svv = *(__global const uint4 *)(sV + (soffC & ~15u) + 16u * rh);
+#ifdef NO_CHROMA
+    uint4 svu = (uint4)(0), svv = (uint4)(0);
+#else
+    uint4 svu = ldg_u32x4((__global const uint4 *)(sU + (soffC & ~15u) + 16u * rh));
+    uint4 svv = ldg_u32x4((__global const uint4 *)(sV + (soffC & ~15u) + 16u * rh));
+#endif
     uint s0 = 0, s1 = 0;
     uint4 scw = (uint4)(0);
 #else
-    uint2 svc = *(__global const uint2 *)((cplane ? sV : sU) + (soffC & ~7u) + 8u * rh);
+#ifdef NO_CHROMA
+    uint2 svc = (uint2)(0);
+#else
+    uint2 svc = ldg_u32x2((__global const uint2 *)((cplane ? sV : sU) + (soffC & ~7u) + 8u * rh));
+#endif
     uint s0 = 0, s1 = 0, scw = 0;
 #endif
 #endif
@@ -1482,7 +1718,9 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     }
     const uint pyi = (uint)q[P_RPY], pui = (uint)q[P_RPU];
     bool prepped = false;
-#if CS == 0
+#ifdef NO_CHROMA
+#define SRC_CHROMA() do { } while (0)
+#elif CS == 0
 #define SRC_CHROMA() do { \
         uint2 gu_ = glu(svu, soffC, rh, scr), gv_ = glu(svv, soffC, rh, scr); \
         scw = (uint4)(gu_.x, gu_.y, gv_.x, gv_.y); \
@@ -1563,23 +1801,26 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
         for (int k = l; k < AREA / 4; k += 32) {
             uint o = off0 + (k / (W / 4)) * (uint)q[P_SPY] + 4 * (k % (W / 4));
             __global const uint *p = (__global const uint *)(sY + (o & ~3u));
-            ss[k] = funnel(p[0], p[1], (o & 3) * 8);
+            ss[k] = funnel(ldg_u32(p), ldg_u32(p + 1), (o & 3) * 8);
         }
+#ifndef NO_CHROMA
         for (int k = l; k < CAREA / 4; k += 32) {
             uint o = coff0 + (k / (CW / 4)) * (uint)q[P_SPU] + 4 * (k % (CW / 4));
             __global const uint *pu_ = (__global const uint *)(sU + (o & ~3u));
             __global const uint *pv_ = (__global const uint *)(sV + (o & ~3u));
             uint sft = (o & 3) * 8;
-            ss[CB + k] = funnel(pu_[0], pu_[1], sft);
-            ss[CB + CAREA / 4 + k] = funnel(pv_[0], pv_[1], sft);
+            ss[CB + k] = funnel(ldg_u32(pu_), ldg_u32(pu_ + 1), sft);
+            ss[CB + CAREA / 4 + k] = funnel(ldg_u32(pv_), ldg_u32(pv_ + 1), sft);
         }
+#endif
 #else
         stage(stl, NCHL, sY, off0, (uint)q[P_SPY], H, (W + 30) / 16, l);
+#ifndef NO_CHROMA
         stage2(stc, NCHC, ROWSC * NCHC, sU, sV, coff0, (uint)q[P_SPU], CH, (CW + 30) / 16, l);
+#endif
         wsync();
         {
             __local const uint *stlw = (__local const uint *)stl;
-            __local const uint *stcw = (__local const uint *)stc;
             uint sl = (off0 & 3u) * 8, wc = (off0 & 15u) >> 2;
             for (uint t = l; t < LT; t += 32) {
                 uint row = t / LTR, grp = t % LTR;
@@ -1588,6 +1829,8 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                 ss[2 * t] = funnel(a0, a1, sl);
                 ss[2 * t + 1] = funnel(a1, a2, sl);
             }
+#ifndef NO_CHROMA
+            __local const uint *stcw = (__local const uint *)stc;
             uint sc = (coff0 & 3u) * 8, cc = (coff0 & 15u) >> 2;
             for (uint t = l; t < CT; t += 32) {
                 uint pr = t / CTR, grp = t % CTR;
@@ -1597,15 +1840,18 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                 ss[CB + t * CTW] = funnel(a0, a1, sc);
                 if (CTW == 2) ss[CB + t * CTW + 1] = funnel(a1, w[2], sc);
             }
+#endif
         }
 #endif
         wsync();
         for (int k = l; k < 2 * LT; k += 32) pl = sad4(ss[k], 0u, pl);
         if (blur && pass == 0) for (int i = l; i < AREA; i += 32) pb += blurred((__local const uchar *)ss, i);
+#ifndef NO_CHROMA
         if (pass == 0) for (int k = l; k < CAREA / 4; k += 32) {
             pu = sad4(ss[CB + k], 0u, pu);
             pw = sad4(ss[CB + CAREA / 4 + k], 0u, pw);
         }
+#endif
         SUMS_REDUCE()
     }
     while (om) {
@@ -1666,7 +1912,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                         int i = TPIX(t, y, x);
                         d[y * 4 + x] = (blur ? blurred(sy, i) : (int)sy[i]) - avg_c;
                     }
-                dl += had4x4(d) / 2;
+                dl += had4x4_half(d);
             }
             for (int t = l; t < CAREA / 16; t += 32) {
                 int tx = (t % (CW / 4)) * 4, ty = (t / (CW / 4)) * 4;
@@ -1677,8 +1923,8 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
                         d[y * 4 + x] = (int)su[i] - au;
                         e[y * 4 + x] = (int)sv[i] - av;
                     }
-                du += had4x4(d) / 2;
-                dv += had4x4(e) / 2;
+                du += had4x4_half(d);
+                dv += had4x4_half(e);
             }
 #else
             if (blur) {
@@ -1715,9 +1961,13 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
             }
 #endif
             dl = wsum(dl, scr);
+#ifdef NO_CHROMA
+            int contrast = min(dl * 2 / AREA, 255);
+#else
             du = wsum(du, scr);
             dv = wsum(dv, scr);
             int contrast = min(dl / AREA + du / CAREA + dv / CAREA, 255);
+#endif
             radius = contrast < 2 ? 0 : 1 + ((radius * min(contrast * 255 / 150, 255)) >> 8);
         }
         cxp = LO(pv.x); cyp = HI(pv.x);
@@ -1744,7 +1994,11 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
     } else {
         cvx = LO(cn.x); cvy = HI(cn.x); craw = cn.y; cmin = cn.z;
     }
+#ifdef EARLY_EXIT
+    const bool do_ex = found && !DONTV && !(craw >= 0 && craw * 2 <= 3 * AREA);
+#else
     const bool do_ex = found && !DONTV;
+#endif
     const int bx = cvx, by = cvy;
 
     int rst = 0;
@@ -1836,7 +2090,9 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
 #endif
                 wsync();
                 stage(stl, NCHL, rY, loff, (uint)q[P_RPY], H + 2 * rst, (W + 2 * rst + 30) / 16, l);
+#ifndef NO_CHROMA
                 stage2(stc, NCHC, ROWSC * NCHC, rU, rV, coff, (uint)q[P_RPU], CH + crst, (CW + crst + 30) / 16, l);
+#endif
                 wsync();
                 const bool g4 = ns <= 8;
                 const int G = g4 ? 4 : 1;
@@ -1990,7 +2246,7 @@ void search(__global const uchar *sY_, __global const uchar *sU_, __global const
 #endif
 
 #if defined(LANEG) && DONTV == 0
-__kernel __attribute__((reqd_work_group_size(WGS, 1, 1)))
+__kernel SEARCH_ATTR
 void refine(__global const uchar *sY_, __global const uchar *sU_, __global const uchar *sV_,
             __global const uchar *rY_, __global const uchar *rU_, __global const uchar *rV_,
             __constant int *q_, __global const int2 *pred_, __global const int2 *rev_,
@@ -2035,7 +2291,11 @@ void refine(__global const uchar *sY_, __global const uchar *sU_, __global const
     const int omin_x = -pel * x0, omin_y = -pel * y0;
     const int omax_x = pel * (PW - x0 - W), omax_y = pel * (PH - y0 - H);
     const int vx = LO(nvec), vy = HI(nvec);
+#ifdef EARLY_EXIT
+    bool valid = gact && nd != 0 && nvec != cn.x && !(cn.y >= 0 && cn.y * 2 <= 3 * AREA);
+#else
     bool valid = gact && nd != 0 && nvec != cn.x;
+#endif
     const bool inside = vx >= omin_x && vx < omax_x && vy >= omin_y && vy < omax_y;
     if (valid && !inside) {
         Sh t = make_sh(x0, y0, pel, PW, PH, vx, vy, 0);
