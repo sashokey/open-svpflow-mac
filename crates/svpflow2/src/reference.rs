@@ -200,22 +200,43 @@ impl FilterState {
         (self.nvof.is_none() && last >= 0 && even).then_some((last, limit, proof))
     }
 
+    fn layer_step(&self) -> i32 {
+        if self.options.fast() < 2 {
+            return 1;
+        }
+        let info = &self.video_info;
+        let fps = if info.fps_den > 0 {
+            info.fps_num as f64 / info.fps_den as f64
+        } else {
+            0.0
+        };
+        if fps >= 330.0 {
+            3
+        } else if fps >= 110.0 {
+            2
+        } else {
+            1
+        }
+    }
+
     fn layer_wanted(&self, wanted: &mut Vec<(vs::Raw, i32)>, n: i32, held: &mut Held) {
         let Some((last, ..)) = self.layer_plan() else {
             return;
         };
-        let (chunk, chunks) = (n / layer::CHUNK, last / layer::CHUNK);
+        let chunks = last / layer::CHUNK;
         let gpu_active =
             self.render_mode == 2 && self.gpu.as_ref().is_some_and(|gpu| !gpu.cpu_render());
         let mut missing = if gpu_active {
+            let step = self.layer_step();
+            let chunk = (n / layer::CHUNK) / step * step;
             self.gpu
                 .as_ref()
-                .map(|gpu| gpu.layer_hold(chunk, chunks, &mut held.gpu))
+                .map(|gpu| gpu.layer_hold(chunk, chunks, step, &mut held.gpu))
                 .unwrap_or_default()
         } else if crate::video_format::is_cpu_source(&self.video_info)
             && let Ok(layers) = self.layers.lock()
         {
-            layers.hold(chunk, chunks, &mut held.cpu)
+            layers.hold(n / layer::CHUNK, chunks, &mut held.cpu)
         } else {
             Vec::new()
         };
@@ -275,15 +296,11 @@ impl FilterState {
         if k < 1 || k >= self.video_info.num_frames {
             return false;
         }
-        let cached =
-            |cache: &Vec<(i32, bool)>| cache.iter().find(|(key, _)| *key == k).map(|v| v.1);
-        if let Some(known) = self
-            .repeat_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cached(&cache))
+        let slot = (k as usize) & 511;
+        if let Ok(cache) = self.repeat_cache.lock()
+            && cache[slot].0 == k
         {
-            return known;
+            return cache[slot].1;
         }
         let frames = [k - 1, k].map(|k| fetch.get(self.clips.source, k));
         let same = (|| {
@@ -296,16 +313,7 @@ impl FilterState {
                 Some((unsafe { slice::from_raw_parts(ptr, len) }, stride))
             };
             let ((first, stride), (second, _)) = (plane(frames[0])?, plane(frames[1])?);
-            let mut total = 0u64;
-            let mut count = 0u64;
-            for y in (0..height).step_by(4) {
-                let row = y * stride..y * stride + width;
-                let pairs = first.get(row.clone())?.iter().zip(second.get(row)?);
-                for (a, b) in pairs.step_by(4) {
-                    total += u64::from(a.abs_diff(*b));
-                    count += 1;
-                }
-            }
+            let (total, count) = abs_diff_step4(first, second, stride, width, height)?;
             Some((total as f64) < threshold * count as f64)
         })();
         for frame in frames {
@@ -315,10 +323,7 @@ impl FilterState {
             return false;
         };
         if let Ok(mut cache) = self.repeat_cache.lock() {
-            if cache.len() >= 512 {
-                cache.remove(0);
-            }
-            cache.push((k, same));
+            cache[slot] = (k, same);
         }
         same
     }
@@ -373,7 +378,8 @@ impl FilterState {
             let none = |_| None::<std::sync::Arc<VectorField>>;
             engine::motions(field, true, true, true, false, (false, false), none, k)
         };
-        let kernel = engine::gpu_params(
+        let fast_peel = self.options.fast() >= 2;
+        let mut kernel = engine::gpu_params(
             params,
             vector_data,
             (width, height),
@@ -383,6 +389,11 @@ impl FilterState {
             false,
             false,
         );
+        if fast_peel {
+            for plane in &mut kernel {
+                plane.cubic = 0;
+            }
+        }
         let cap = self.field_cap(shape);
         let get = |node, k| fetch.get(node, k);
         let chunks = self.chunks(api, &get, vector_data, last, &held.asked);
@@ -396,10 +407,18 @@ impl FilterState {
             });
             Some(motion(k, field.as_ref()?))
         };
-        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, true, &motions);
+        let pairs = |chunk: i64| chunks.uploaded(gpu, chunk, true, fast_peel, &motions);
+        let proof = if fast_peel {
+            (proof * 0.5).max(2.0)
+        } else {
+            proof
+        };
+        let step = self.layer_step();
+        let chunk = (n / layer::CHUNK) / step * step;
         gpu.layer_fit(
-            i64::from(n / layer::CHUNK),
+            i64::from(chunk),
             i64::from(last / layer::CHUNK),
+            i64::from(step),
             &kernel,
             cells,
             limit,
@@ -552,6 +571,7 @@ impl FilterState {
             still,
             layer.map(|layer| &**layer),
             cover,
+            (self.options.fast(), self.options.fast_gpu()),
         );
         if done.is_none() {
             unsafe { api.free(output.cast_const()) };
@@ -725,7 +745,10 @@ impl FilterState {
             let engine::Step { n, raw, phase } = rates.step(&params, frame);
             let moved = self.dedup(&fetch, &api, n, raw);
             if !engine::needs_vectors(phase) && moved != (n, raw) {
-                self.vectors_wanted(&mut wanted, moved.0..=moved.0, 0, held);
+                let moved_phase = rates.phase(&params, moved.1);
+                if engine::needs_vectors(moved_phase) {
+                    self.vectors_wanted(&mut wanted, moved.0..=moved.0, 0, held);
+                }
             }
         }
         if wanted.is_empty() {
@@ -733,6 +756,61 @@ impl FilterState {
         }
         request_all(request_frame, wanted, frame_ctx);
         true
+    }
+
+    pub(crate) unsafe fn pure_sources(
+        &self,
+        entries: &[(i32, f32)],
+        frame_ctx: vs::Raw,
+        vsapi: vs::ConstRaw,
+    ) -> Option<Vec<(i32, f32)>> {
+        if !self.reference_enabled()
+            || !crate::video_format::is_cpu_source(&self.video_info)
+            || crate::video_format::source_depth(&self.video_info) > 8
+            || self.options.debug_qmap()
+            || self.options.debug_vectors()
+            || self.options.debug_qmode()
+            || self.options.debug_tt()
+            || self.options.padding(&self.video_info.source()) != (0, 0)
+        {
+            return None;
+        }
+        let get_frame = unsafe { vs::table_fn::<vs::GetFrameFilter>(vsapi, vs::GET_FRAME_FILTER) }?;
+        let api = unsafe { frame::PlaneApi::load(vsapi) }?;
+        let fetch = Fetch {
+            get_frame,
+            free_frame: unsafe { vs::table_fn::<vs::FreeFrame>(vsapi, vs::FREE_FRAME) },
+            frame_ctx,
+        };
+        let params = self.options.reference();
+        let rates = self.rates(&params);
+        let dedup = self.dedup_limit().is_some();
+        let last = (self.video_info.num_frames - 1).max(0);
+        let mut out = Vec::with_capacity(entries.len());
+        for &(frame, weight) in entries {
+            let engine::Step {
+                mut n,
+                mut raw,
+                mut phase,
+            } = rates.step(&params, frame);
+            if dedup {
+                let moved = self.dedup(&fetch, &api, n, raw);
+                if moved != (n, raw) {
+                    (n, raw) = moved;
+                    phase = rates.phase(&params, raw);
+                }
+            }
+            if engine::needs_vectors(phase) {
+                return None;
+            }
+            let use_next = phase == 256;
+            if use_next && self.image.is_some() {
+                return None;
+            }
+            let idx = if use_next { n.saturating_add(1) } else { n }.clamp(0, last);
+            out.push((idx, weight));
+        }
+        Some(out)
     }
 
     fn with_vectors<R>(
@@ -751,20 +829,20 @@ impl FilterState {
                         return None;
                     };
                     let (w, h) = nvof.dimensions();
+                    let down = nvof.downscale();
                     let current = fetch.get(self.clips.vec_src, k);
                     let next = fetch.get(self.clips.vec_src, k + 1);
-                    let packed = unsafe {
-                        (
-                            crate::core::pack_nv12_frame(api, current, w, h),
-                            crate::core::pack_nv12_frame(api, next, w, h),
+                    let result = nvof
+                        .generate_lazy(
+                            k,
+                            || unsafe { crate::core::pack_nv12_frame(api, current, w, h, down) },
+                            || unsafe { crate::core::pack_nv12_frame(api, next, w, h, down) },
+                            data,
                         )
-                    };
+                        .ok();
                     fetch.drop(current);
                     fetch.drop(next);
-                    let (Some(current), Some(next)) = packed else {
-                        return None;
-                    };
-                    nvof.generate(k, &current, &next, data).ok()?
+                    result?
                 }
             };
             return Some(f(&payload));
@@ -867,6 +945,26 @@ impl FilterState {
             return std::ptr::null();
         }
         let copy = engine::copy_choice(&params, phase, class, self.options.debug_vectors());
+        let loaded_field = if copy.is_none()
+            && params.fast >= 1
+            && blend.is_none()
+            && self.image.is_none()
+            && self.options.mask_still().is_none()
+            && self.options.mask_peel().is_none()
+            && !self.options.debug_qmap()
+            && !self.options.debug_qmode()
+            && !self.options.debug_tt()
+        {
+            Some(field())
+        } else {
+            None
+        };
+        let copy = copy.or_else(|| {
+            loaded_field
+                .as_ref()
+                .filter(|loaded| class != 3 && loaded.is_static())
+                .map(|_| phase > 127)
+        });
         if let Some(use_next) = copy {
             let (selected, other) = if use_next {
                 (next_source, source)
@@ -890,7 +988,7 @@ impl FilterState {
             }
             fetch.drop(other);
             if !output.is_null() && engine::needs_vectors(phase) {
-                let field = field();
+                let field = loaded_field.unwrap_or_else(field);
                 unsafe {
                     self.reference_overlays(
                         &api,
@@ -908,7 +1006,7 @@ impl FilterState {
             return output;
         }
         let (use_fwd, use_bwd, force13) = engine::directions(&params, phase, class);
-        let field = field();
+        let field = loaded_field.unwrap_or_else(field);
         let gpu_failed = std::cell::Cell::new(false);
         let calculate = |cpu| unsafe {
             self.reference_calculate(
@@ -1006,7 +1104,9 @@ impl FilterState {
         let time = engine::render_time(phase, use_fwd, use_bwd);
         let neither = !use_fwd && !use_bwd;
         let algo = params.algo;
+        let adaptive_blend = blend.is_some_and(crate::gpu::BlendJob::is_adaptive);
         let gpu_cover = !cpu
+            && !adaptive_blend
             && self.render_mode == 2
             && self
                 .gpu
@@ -1019,7 +1119,7 @@ impl FilterState {
             cover_bwd,
             cover_fwd,
             sad: sad_masks,
-        } = engine::masks(field, params, time, neither, !gpu_cover);
+        } = engine::masks(field, params, time, neither, !gpu_cover && !adaptive_blend);
         let want_extended = neighbors_ok && algo == 23 && !neither;
         let (zerox, zeroy) = (self.options.debug_zerox(), self.options.debug_zeroy());
         let motion_key = engine::motion_key(n, use_fwd, use_bwd, want_extended, (zerox, zeroy));
@@ -1073,6 +1173,7 @@ impl FilterState {
             )
         });
         renderer.set_time(time);
+        renderer.set_fast(params.fast, params.fast_cpu());
         if self.render_mode == 2
             && !cpu
             && let Some(gpu) = self.gpu.as_ref()
@@ -1170,7 +1271,8 @@ impl FilterState {
             unsafe { self.draw(api, frames, draw, expand, core) }.map(|(output, _)| (output, None))
         } else {
             let expand = |k: i32, planes| {
-                if metadata::super_data(self.sdata).lean() {
+                let super_data = metadata::super_data(self.sdata);
+                if super_data.lean() || super_data.luma_only() {
                     return self.cached_lean_expand(i64::from(k), planes);
                 }
                 let sup = fetch.get(self.clips.super_clip, k);
@@ -1535,4 +1637,112 @@ fn request_all(
     for (node, k) in wanted {
         request_node(request_frame, node, k, frame_ctx);
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn abs_diff_row_step4_avx2(a: &[u8], b: &[u8]) -> (u64, u64) {
+    use std::arch::x86_64::{
+        _mm256_add_epi64, _mm256_and_si256, _mm256_extract_epi64, _mm256_loadu_si256,
+        _mm256_sad_epu8, _mm256_set1_epi32, _mm256_setzero_si256,
+    };
+    let len = a.len().min(b.len());
+    let mask = _mm256_set1_epi32(0x0000_00FF);
+    let mut acc = _mm256_setzero_si256();
+    let mut x = 0usize;
+    let mut count = 0u64;
+    while x + 32 <= len {
+        unsafe {
+            let va = _mm256_and_si256(_mm256_loadu_si256(a.as_ptr().add(x).cast()), mask);
+            let vb = _mm256_and_si256(_mm256_loadu_si256(b.as_ptr().add(x).cast()), mask);
+            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(va, vb));
+        }
+        x += 32;
+        count += 8;
+    }
+    let mut total = (_mm256_extract_epi64::<0>(acc) as u64)
+        + (_mm256_extract_epi64::<1>(acc) as u64)
+        + (_mm256_extract_epi64::<2>(acc) as u64)
+        + (_mm256_extract_epi64::<3>(acc) as u64);
+    while x < len {
+        total += u64::from(a[x].abs_diff(b[x]));
+        count += 1;
+        x += 4;
+    }
+    (total, count)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn abs_diff_row_step4_neon(a: &[u8], b: &[u8]) -> (u64, u64) {
+    use std::arch::aarch64::{
+        vabdq_u8, vaddlvq_u32, vandq_u8, vdupq_n_u32, vld1q_u8, vpadalq_u16, vpaddlq_u8,
+        vreinterpretq_u8_u32,
+    };
+    let len = a.len().min(b.len());
+    let mask = unsafe { vreinterpretq_u8_u32(vdupq_n_u32(0x0000_00FF)) };
+    let mut acc = unsafe { vdupq_n_u32(0) };
+    let mut x = 0usize;
+    let mut count = 0u64;
+    while x + 16 <= len {
+        unsafe {
+            let va = vld1q_u8(a.as_ptr().add(x));
+            let vb = vld1q_u8(b.as_ptr().add(x));
+            let diff = vandq_u8(vabdq_u8(va, vb), mask);
+            acc = vpadalq_u16(acc, vpaddlq_u8(diff));
+        }
+        x += 16;
+        count += 4;
+    }
+    let mut total = unsafe { vaddlvq_u32(acc) };
+    while x < len {
+        total += u64::from(a[x].abs_diff(b[x]));
+        count += 1;
+        x += 4;
+    }
+    (total, count)
+}
+
+fn abs_diff_step4(
+    first: &[u8],
+    second: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Option<(u64, u64)> {
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let mut total = 0u64;
+    let mut count = 0u64;
+    for y in (0..height).step_by(4) {
+        let range = y * stride..y * stride + width;
+        let a = first.get(range.clone())?;
+        let b = second.get(range)?;
+        #[cfg(target_arch = "x86_64")]
+        let (rt, rc) = if avx2 {
+            unsafe { abs_diff_row_step4_avx2(a, b) }
+        } else {
+            let mut t = 0u64;
+            let mut c = 0u64;
+            for (&x, &y) in a.iter().zip(b).step_by(4) {
+                t += u64::from(x.abs_diff(y));
+                c += 1;
+            }
+            (t, c)
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (rt, rc) = abs_diff_row_step4_neon(a, b);
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let (rt, rc) = {
+            let mut t = 0u64;
+            let mut c = 0u64;
+            for (&x, &y) in a.iter().zip(b).step_by(4) {
+                t += u64::from(x.abs_diff(y));
+                c += 1;
+            }
+            (t, c)
+        };
+        total += rt;
+        count += rc;
+    }
+    Some((total, count))
 }

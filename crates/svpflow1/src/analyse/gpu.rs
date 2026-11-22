@@ -3,10 +3,15 @@ use core::ffi::{CStr, c_void};
 use std::ffi::CString;
 use std::sync::{Mutex, OnceLock};
 
+use svpflow_host::context::{
+    SharedSource, plane_fingerprint, publish_source, purge_sources, unpublish_mems,
+};
+use svpflow_host::hardware::{GpuProfile, GpuVendor};
 use svpflow_host::opencl::{
-    CL_DEVICE_TYPE_GPU, CL_EVENT_COMMAND_EXECUTION_STATUS, CL_FALSE, CL_MAP_READ,
-    CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo,
-    Handle, OpenCl as CoreCl,
+    CL_DEVICE_EXTENSIONS, CL_DEVICE_TYPE_GPU, CL_FALSE,
+    CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE, CL_MAP_READ, CL_MEM_ALLOC_HOST_PTR,
+    CL_MEM_READ_WRITE, CL_SUCCESS, CL_TRUE, ClInt, ClUint, FnKernelInfo, FnRelease, Handle,
+    OpenCl as CoreCl,
 };
 
 type FnFillBuffer = unsafe extern "C" fn(
@@ -21,11 +26,25 @@ type FnFillBuffer = unsafe extern "C" fn(
     *mut Handle,
 ) -> ClInt;
 
+type FnKernelSubGroupInfo = unsafe extern "C" fn(
+    Handle,
+    Handle,
+    ClUint,
+    usize,
+    *const c_void,
+    usize,
+    *mut c_void,
+    *mut usize,
+) -> ClInt;
+
 #[allow(non_snake_case)]
 struct OpenCl {
     core: CoreCl,
     GetKernelWorkGroupInfo: FnKernelInfo,
+    GetKernelSubGroupInfo: Option<FnKernelSubGroupInfo>,
     EnqueueFillBuffer: FnFillBuffer,
+    ReleaseKernel: Option<FnRelease>,
+    ReleaseProgram: Option<FnRelease>,
 }
 
 impl std::ops::Deref for OpenCl {
@@ -41,7 +60,10 @@ impl OpenCl {
         let core = unsafe { CoreCl::load()? };
         Ok(Self {
             GetKernelWorkGroupInfo: unsafe { core.symbol("clGetKernelWorkGroupInfo\0")? },
+            GetKernelSubGroupInfo: unsafe { core.symbol("clGetKernelSubGroupInfo\0").ok() },
             EnqueueFillBuffer: unsafe { core.symbol("clEnqueueFillBuffer\0")? },
+            ReleaseKernel: unsafe { core.symbol("clReleaseKernel\0").ok() },
+            ReleaseProgram: unsafe { core.symbol("clReleaseProgram\0").ok() },
             core,
         })
     }
@@ -50,6 +72,7 @@ impl OpenCl {
 use super::chain::Pyramid;
 use super::field::recalc::{CompactPlan, RecalcPlan};
 use super::field::{GpuSearchParams, Mv};
+use super::params::{FAST_EARLY_EXIT, FAST_NO_CHROMA, FAST_SAD_GATED_SATD, FAST_STRIDE_SAD};
 
 #[path = "gpu_chain.rs"]
 mod chain;
@@ -57,11 +80,109 @@ use chain::ChainBuffers;
 
 const CL_DEVICE_MAX_WORK_GROUP_SIZE: ClUint = 0x1004;
 const CL_DEVICE_LOCAL_MEM_SIZE: ClUint = 0x1023;
+const CL_DEVICE_OPENCL_C_VERSION: ClUint = 0x103D;
 const CL_KERNEL_COMPILE_WORK_GROUP_SIZE: ClUint = 0x11B1;
+const CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE: ClUint = 0x2033;
+
+const SG_KHR: u8 = 1 << 0;
+const SG_SHUFFLE: u8 = 1 << 1;
+const SG_BALLOT: u8 = 1 << 2;
+const SG_INTEL: u8 = 1 << 3;
+const SG_INTEL_REQD: u8 = 1 << 4;
+
+#[derive(Clone, Copy)]
+struct SearchCaps {
+    vendor: GpuVendor,
+    flags: u8,
+    cl_std: u8,
+}
+
+impl SearchCaps {
+    fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn subgroups(self) -> bool {
+        self.vendor != GpuVendor::Nvidia
+            && ((self.vendor == GpuVendor::Intel
+                && self.has(SG_INTEL)
+                && self.has(SG_INTEL_REQD))
+                || (self.has(SG_KHR) && self.has(SG_SHUFFLE)))
+    }
+}
+
+unsafe fn device_str(cl: &CoreCl, device: Handle, param: ClUint) -> String {
+    let mut len = 0usize;
+    if unsafe {
+        (cl.GetDeviceInfo)(
+            device,
+            param,
+            0,
+            std::ptr::null_mut(),
+            &raw mut len,
+        )
+    } != CL_SUCCESS
+        || len == 0
+    {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len];
+    if unsafe {
+        (cl.GetDeviceInfo)(
+            device,
+            param,
+            len,
+            buf.as_mut_ptr().cast(),
+            std::ptr::null_mut(),
+        )
+    } != CL_SUCCESS
+    {
+        return String::new();
+    }
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+impl SearchCaps {
+    unsafe fn probe(cl: &CoreCl, device: Handle, profile: GpuProfile) -> Self {
+        let exts = unsafe { device_str(cl, device, CL_DEVICE_EXTENSIONS) };
+        let cl_c = unsafe { device_str(cl, device, CL_DEVICE_OPENCL_C_VERSION) };
+        let has = |name: &str| exts.split_whitespace().any(|e| e == name);
+        let mut flags = 0u8;
+        if has("cl_khr_subgroups") {
+            flags |= SG_KHR;
+        }
+        if has("cl_khr_subgroup_shuffle") {
+            flags |= SG_SHUFFLE;
+        }
+        if has("cl_khr_subgroup_ballot") {
+            flags |= SG_BALLOT;
+        }
+        if has("cl_intel_subgroups") {
+            flags |= SG_INTEL;
+        }
+        if has("cl_intel_required_subgroup_size") {
+            flags |= SG_INTEL_REQD;
+        }
+        let cl_std = if cl_c.starts_with("OpenCL C 3.") {
+            3
+        } else if cl_c.starts_with("OpenCL C 2.") {
+            2
+        } else {
+            1
+        };
+        Self {
+            vendor: profile.vendor,
+            flags,
+            cl_std,
+        }
+    }
+}
 const CHUNK: usize = 16384;
 const RECORD: usize = 12;
 const RECORD_BYTES: usize = RECORD * size_of::<i32>();
-const UNITS: usize = 4;
 static ZERO: u8 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +192,7 @@ pub(crate) struct Variant {
     pub(crate) satd: bool,
     pub(crate) shift: u32,
     pub(crate) dev: bool,
+    pub(crate) fast_flags: u8,
 }
 
 impl Variant {
@@ -81,15 +203,32 @@ impl Variant {
             satd,
             shift: 1,
             dev: false,
+            fast_flags: 0,
         }
     }
+}
+
+fn fast_defines(flags: u8, satd: bool) -> String {
+    let mut out = String::new();
+    if flags & FAST_NO_CHROMA != 0 {
+        out.push_str("#define NO_CHROMA 1\n");
+    }
+    if !satd && flags & FAST_STRIDE_SAD != 0 {
+        out.push_str("#define STRIDE_SAD 1\n");
+    }
+    if flags & FAST_EARLY_EXIT != 0 {
+        out.push_str("#define EARLY_EXIT 1\n");
+    }
+    if satd && flags & FAST_SAD_GATED_SATD != 0 {
+        out.push_str("#define SAD_GATED_SATD 1\n");
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
 enum Arg {
     Mem(Handle),
     Int(i32),
-    Long(i64),
     V4([i32; 4]),
     V8([i32; 8]),
 }
@@ -171,6 +310,8 @@ pub(crate) struct RefineGpu {
     cl: OpenCl,
     context: usize,
     device: usize,
+    caps: SearchCaps,
+    pool_budget: usize,
     programs: Mutex<Vec<(Variant, usize)>>,
     search_programs: Mutex<Vec<(SearchKey, usize)>>,
     units: Vec<Mutex<Unit>>,
@@ -198,9 +339,6 @@ impl Drop for Permit<'_> {
         self.0.admitted.notify_all();
     }
 }
-
-const POOLED: usize = 3 * UNITS;
-const POOL_BUDGET: usize = 128 << 20;
 
 struct Uploaded {
     mems: [usize; 3],
@@ -257,13 +395,19 @@ impl Drop for CachedFrame {
                 (gpu.cl.WaitForEvents)(1, (&raw const uploaded.event).cast::<Handle>());
                 (gpu.cl.ReleaseEvent)(uploaded.event as Handle);
             }
+            let reusable = unsafe { unpublish_mems(&gpu.cl.core, uploaded.mems) };
             let mut pool = gpu.pool.lock().ok();
             let mut pooled_bytes: usize = pool
                 .as_ref()
                 .map_or(0, |pool| pool.iter().map(|&(_, s)| s).sum());
+            let pooled_cap = 3 * gpu.units.len();
             for (mem, size) in uploaded.mems.into_iter().zip(uploaded.sizes) {
                 match pool.as_mut() {
-                    Some(pool) if pool.len() < POOLED && pooled_bytes + size <= POOL_BUDGET => {
+                    Some(pool)
+                        if reusable
+                            && pool.len() < pooled_cap
+                            && pooled_bytes + size <= gpu.pool_budget =>
+                    {
                         pool.push((mem, size));
                         pooled_bytes += size;
                     }
@@ -280,6 +424,7 @@ pub(crate) struct Planes<'a> {
     pub(crate) data: [&'a [u8]; 3],
     pub(crate) pitch: [usize; 3],
     pub(crate) base: [usize; 3],
+    pub(crate) width: [usize; 3],
     pub(crate) height: [i32; 3],
     pub(crate) pel: i32,
     pub(crate) expand: bool,
@@ -296,6 +441,7 @@ pub(crate) fn refine_gpu() -> Option<&'static RefineGpu> {
 }
 
 pub(crate) fn trim() {
+    purge_sources();
     if let Some(Some(gpu)) = GPU.get()
         && let Ok(mut pool) = gpu.pool.lock()
     {
@@ -380,8 +526,12 @@ impl RefineGpu {
             if context.is_null() {
                 continue;
             }
-            let mut units = Vec::with_capacity(UNITS);
-            for _ in 0..UNITS {
+            let profile = unsafe { GpuProfile::probe(&cl.core, device) };
+            let caps = unsafe { SearchCaps::probe(&cl.core, device, profile) };
+            let unit_count = profile.analyse_units(svpflow_core::threads::workers());
+            let pool_budget = profile.pool_budget_bytes();
+            let mut units = Vec::with_capacity(unit_count);
+            for _ in 0..unit_count {
                 let queue = unsafe { (cl.CreateCommandQueue)(context, device, 0, &raw mut err) };
                 if err == CL_SUCCESS && !queue.is_null() {
                     units.push(Mutex::new(Unit {
@@ -397,6 +547,8 @@ impl RefineGpu {
                 cl,
                 context: context as usize,
                 device: device as usize,
+                caps,
+                pool_budget,
                 programs: Mutex::new(Vec::new()),
                 search_programs: Mutex::new(Vec::new()),
                 cache: Mutex::new(Cache::default()),
@@ -425,8 +577,9 @@ impl RefineGpu {
             return Some(program);
         }
         let kernel = if variant.width == 4 { COMPACT } else { KERNEL };
+        let fast = fast_defines(variant.fast_flags, variant.satd);
         let program = self.build(&format!(
-            "#define W {}\n#define H {}\n#define SATD {}\n#define S {}\n#define RECORD {RECORD}\n{}{kernel}",
+            "#define W {}\n#define H {}\n#define SATD {}\n#define S {}\n#define RECORD {RECORD}\n{}{fast}{kernel}",
             variant.width,
             variant.height,
             u8::from(variant.satd),
@@ -437,15 +590,60 @@ impl RefineGpu {
         Some(program)
     }
 
+    fn verify_subgroup_size(&self, program: usize, bpw: usize) -> bool {
+        let cl = &self.cl;
+        let device = self.device as Handle;
+        let mut err = 0;
+        let kernel =
+            unsafe { (cl.CreateKernel)(program as Handle, c"search".as_ptr(), &raw mut err) };
+        if err != CL_SUCCESS || kernel.is_null() {
+            return false;
+        }
+        let local_range = [32 * bpw, 1usize, 1usize];
+        let mut sg = 0usize;
+        let got_sg = cl.GetKernelSubGroupInfo.is_some_and(|f| unsafe {
+            f(
+                kernel,
+                device,
+                CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
+                size_of_val(&local_range),
+                local_range.as_ptr().cast(),
+                size_of::<usize>(),
+                (&raw mut sg).cast(),
+                std::ptr::null_mut(),
+            ) == CL_SUCCESS
+        });
+        if !got_sg {
+            let ok = unsafe {
+                (cl.GetKernelWorkGroupInfo)(
+                    kernel,
+                    device,
+                    CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                    size_of::<usize>(),
+                    (&raw mut sg).cast(),
+                    std::ptr::null_mut(),
+                ) == CL_SUCCESS
+            };
+            if !ok {
+                sg = 0;
+            }
+        }
+        if let Some(rel) = cl.ReleaseKernel {
+            unsafe { rel(kernel) };
+        }
+        sg >= 32 && (bpw == 1 || sg == 32)
+    }
+
     fn search_program(&self, variant: Variant, rmax: usize, spec: [i32; 5]) -> Option<usize> {
         let mut programs = self.search_programs.lock().ok()?;
         if let Some(&(_, program)) = programs.iter().find(|(v, _)| *v == (variant, rmax, spec)) {
             return Some(program);
         }
-        let build = |portable: &str| {
+        let fast = fast_defines(variant.fast_flags, variant.satd);
+        let build_opts = |extra: &str, opts: &CStr| {
             self.build_with(
                 &format!(
-                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{portable}{SEARCH}",
+                    "#define W {}\n#define H {}\n#define CS {}\n#define RMAX {}\n{}#define PELV {}\n#define LOGAV {}\n#define DONTV {}\n#define BLURV {}\n#define BORDERV {}\n{fast}{extra}{SEARCH}",
                     variant.width,
                     variant.height,
                     variant.shift,
@@ -457,12 +655,67 @@ impl RefineGpu {
                     spec[3],
                     spec[4]
                 ),
-                c"-cl-fp32-correctly-rounded-divide-sqrt",
+                opts,
             )
         };
-        let program = build("")
-            .or_else(|| build("#define NO_REDUX 1\n"))
-            .or_else(|| build("#define NO_NV_ASM 1\n"))?;
+        let base_opts = c"-cl-fp32-correctly-rounded-divide-sqrt";
+        let build = |extra: &str| build_opts(extra, base_opts);
+        let caps = self.caps;
+        let program = if caps.vendor == GpuVendor::Nvidia {
+            build("")
+                .or_else(|| build("#define NO_REDUX 1\n"))
+                .or_else(|| build("#define NO_NV_ASM 1\n"))?
+        } else {
+            let build_sg = |bpw: usize, vendor_defs: &str| {
+                let mut defs = format!("#define USE_SUBGROUPS 1\n#define SUBGROUP_BPW {bpw}\n");
+                if caps.has(SG_KHR) {
+                    defs.push_str("#define USE_KHR_SUBGROUPS 1\n");
+                }
+                if caps.has(SG_SHUFFLE) {
+                    defs.push_str("#define USE_KHR_SHUFFLE 1\n");
+                }
+                if caps.has(SG_BALLOT) {
+                    defs.push_str("#define USE_SUBGROUP_BALLOT 1\n");
+                }
+                defs.push_str(vendor_defs);
+                let sg_opts = match caps.cl_std {
+                    3 => Some(c"-cl-std=CL3.0 -cl-fp32-correctly-rounded-divide-sqrt"),
+                    2 => Some(c"-cl-std=CL2.0 -cl-fp32-correctly-rounded-divide-sqrt"),
+                    _ => None,
+                };
+                let prog = sg_opts
+                    .and_then(|o| build_opts(&defs, o))
+                    .or_else(|| build_opts(&defs, base_opts))?;
+                if self.verify_subgroup_size(prog, bpw) {
+                    Some(prog)
+                } else {
+                    if let Some(rel) = self.cl.ReleaseProgram {
+                        unsafe { rel(prog as Handle) };
+                    }
+                    None
+                }
+            };
+            let subgroups = caps.subgroups();
+            if subgroups && caps.vendor == GpuVendor::Amd {
+                build_sg(2, "#define AMD_GCN 1\n")
+                    .or_else(|| build_sg(1, "#define AMD_GCN 1\n"))
+                    .or_else(|| build_sg(2, ""))
+                    .or_else(|| build_sg(1, ""))
+                    .or_else(|| build("#define AMD_GCN 1\n"))
+                    .or_else(|| build(""))?
+            } else if subgroups && caps.vendor == GpuVendor::Intel && caps.has(SG_INTEL_REQD) {
+                build_sg(2, "#define INTEL_GPU 1\n#define INTEL_REQD_SG32 1\n")
+                    .or_else(|| build(""))?
+            } else if subgroups {
+                build_sg(2, "")
+                    .or_else(|| build_sg(1, ""))
+                    .or_else(|| build(""))?
+            } else if caps.vendor == GpuVendor::Amd {
+                build("#define AMD_GCN 1\n").or_else(|| build(""))?
+            } else {
+                build("")?
+            }
+        };
         programs.push(((variant, rmax, spec), program));
         Some(program)
     }
@@ -518,6 +771,9 @@ impl RefineGpu {
             )
         };
         if built != CL_SUCCESS {
+            if let Some(rel) = cl.ReleaseProgram {
+                unsafe { rel(program) };
+            }
             return None;
         }
         Some(program as usize)
@@ -784,6 +1040,19 @@ impl Session<'_, '_> {
         Some((kernel, size[0]))
     }
 
+    unsafe fn set_args(&self, kernel: Handle, args: &[Arg]) -> bool {
+        let cl = &self.gpu.cl;
+        args.iter().enumerate().all(|(index, arg)| {
+            let (size, value): (usize, *const c_void) = match arg {
+                Arg::Mem(v) => (size_of::<Handle>(), (&raw const *v).cast()),
+                Arg::Int(v) => (4, (&raw const *v).cast()),
+                Arg::V4(v) => (16, v.as_ptr().cast()),
+                Arg::V8(v) => (32, v.as_ptr().cast()),
+            };
+            unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
+        })
+    }
+
     unsafe fn launch(
         &mut self,
         (program, name): (usize, &'static CStr),
@@ -796,16 +1065,7 @@ impl Session<'_, '_> {
         let (kernel, _) = unsafe { self.ckernel(program, name)? };
         let cl = &self.gpu.cl;
         let queue = self.unit.queue as Handle;
-        let set = args.iter().enumerate().all(|(index, arg)| {
-            let (size, value): (usize, *const c_void) = match arg {
-                Arg::Mem(v) => (size_of::<Handle>(), (&raw const *v).cast()),
-                Arg::Int(v) => (4, (&raw const *v).cast()),
-                Arg::Long(v) => (8, (&raw const *v).cast()),
-                Arg::V4(v) => (16, v.as_ptr().cast()),
-                Arg::V8(v) => (32, v.as_ptr().cast()),
-            };
-            unsafe { (cl.SetKernelArg)(kernel, index as ClUint, size, value) == CL_SUCCESS }
-        });
+        let set = unsafe { self.set_args(kernel, args) };
         let global = match local {
             Some(local) => global.next_multiple_of(local),
             None => global.max(1),
@@ -819,6 +1079,44 @@ impl Session<'_, '_> {
                     std::ptr::null(),
                     &raw const global,
                     local.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                    waits.len() as ClUint,
+                    if waits.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        waits.as_ptr().cast()
+                    },
+                    event.cast(),
+                )
+            } != CL_SUCCESS
+        {
+            unsafe { (cl.Finish)(queue) };
+            return None;
+        }
+        Some(())
+    }
+
+    unsafe fn launch_2d(
+        &mut self,
+        (program, name): (usize, &'static CStr),
+        args: &[Arg],
+        global: [usize; 2],
+        waits: &[Handle],
+        event: *mut Handle,
+    ) -> Option<()> {
+        let (kernel, _) = unsafe { self.ckernel(program, name)? };
+        let cl = &self.gpu.cl;
+        let queue = self.unit.queue as Handle;
+        let set = unsafe { self.set_args(kernel, args) };
+        let global = [global[0].max(1), global[1].max(1)];
+        if !set
+            || unsafe {
+                (cl.EnqueueNDRangeKernel)(
+                    queue,
+                    kernel,
+                    2,
+                    std::ptr::null(),
+                    global.as_ptr(),
+                    std::ptr::null(),
                     waits.len() as ClUint,
                     if waits.is_empty() {
                         std::ptr::null()
@@ -908,7 +1206,7 @@ impl Session<'_, '_> {
             cache.live.retain(|e| e.strong_count() > 0);
             cache.live.push(std::sync::Arc::downgrade(&entry));
             cache.recent.push_back(entry.clone());
-            if cache.recent.len() > 2 * UNITS {
+            if cache.recent.len() > 2 * gpu.units.len() {
                 cache.recent.pop_front();
             }
             (entry, guard)
@@ -1061,15 +1359,17 @@ impl Session<'_, '_> {
             {
                 failed = region * 4 > lengths[plane]
                     || unsafe {
-                        self.launch(
+                        self.launch_2d(
                             (program, c"expand"),
                             &[
                                 Arg::Mem(mem),
-                                Arg::Long(planes.pitch[plane] as i64),
-                                Arg::Long(i64::from(planes.height[plane])),
+                                Arg::Int(planes.pitch[plane] as i32),
+                                Arg::Int(planes.height[plane]),
                             ],
-                            3 * region,
-                            None,
+                            [
+                                planes.pitch[plane].div_ceil(4),
+                                planes.height[plane].max(0) as usize,
+                            ],
                             &[],
                             if plane == 2 {
                                 &raw mut event
@@ -1086,6 +1386,42 @@ impl Session<'_, '_> {
                     unsafe { (cl.ReleaseMemObject)(m as Handle) };
                 }
                 return None;
+            }
+        }
+        if planes.lean
+            && planes.base == [0, 0, 0]
+            && (planes.pel == 1 || expand.is_some())
+            && planes.width[0] > 0
+            && planes.height[0] > 0
+            && planes.width[1] > 0
+            && planes.height[1] > 0
+            && planes.width[1] == planes.width[2]
+            && planes.height[1] == planes.height[2]
+        {
+            unsafe { (cl.Flush)(self.unit.queue as Handle) };
+            let h0 = planes.height[0] as usize;
+            let h1 = planes.height[1] as usize;
+            let hash = plane_fingerprint([
+                (planes.data[0], planes.pitch[0], planes.width[0], h0),
+                (planes.data[1], planes.pitch[1], planes.width[1], h1),
+                (planes.data[2], planes.pitch[2], planes.width[2], h1),
+            ]);
+            unsafe {
+                publish_source(
+                    &cl.core,
+                    self.gpu.context as Handle,
+                    hash,
+                    SharedSource {
+                        y_ptr: planes.data[0].as_ptr() as usize,
+                        mems: mems.map(|m| m as Handle),
+                        pitches: planes.pitch,
+                        width: planes.width[0],
+                        height: h0,
+                        chroma_width: planes.width[1],
+                        chroma_height: h1,
+                        event,
+                    },
+                );
             }
         }
         Some(Uploaded {
@@ -1118,6 +1454,7 @@ impl Session<'_, '_> {
         );
         let program = self.gpu.program(Variant {
             shift: plan.shift,
+            fast_flags: plan.fast_flags,
             ..Variant::new(plan.width, plan.height, plan.satd)
         })?;
         let ticket = unsafe { self.enqueue(plan, src, reference, program, source, target) };
@@ -1140,6 +1477,7 @@ impl Session<'_, '_> {
         );
         let program = self.gpu.program(Variant {
             shift: plan.shift,
+            fast_flags: plan.fast_flags,
             ..Variant::new(4, 4, plan.satd)
         })?;
         let ticket = unsafe { self.enqueue_compact(plan, src, reference, program, source, target) };
@@ -1357,6 +1695,7 @@ impl Session<'_, '_> {
         let programs = self.gpu.search_pair(
             Variant {
                 shift: params.shift,
+                fast_flags: params.fast_flags,
                 ..Variant::new(params.width, params.height, params.satd)
             },
             params.rmax,
@@ -1527,7 +1866,7 @@ impl Session<'_, '_> {
             self.launch_search(
                 &mems,
                 (blocks, params.border),
-                if params.q[32] == 0 { SWEEPS } else { 0 },
+                if params.q[32] == 0 { params.sweeps } else { 0 },
                 programs,
                 params.width == 8 && params.height == 8,
                 &events,
@@ -1569,29 +1908,13 @@ impl Session<'_, '_> {
             return true;
         }
         let cl = &self.gpu.cl;
-        unsafe { (cl.Flush)(self.unit.queue as Handle) };
+        let queue = self.unit.queue as Handle;
+        unsafe { (cl.Flush)(queue) };
         let mut ok = true;
         for event in self.pending.drain(..) {
             let event = event as Handle;
-            loop {
-                let mut status: ClInt = 1;
-                let got = unsafe {
-                    (cl.GetEventInfo)(
-                        event,
-                        CL_EVENT_COMMAND_EXECUTION_STATUS,
-                        size_of::<ClInt>(),
-                        (&raw mut status).cast(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                if got != CL_SUCCESS || status < 0 {
-                    ok = false;
-                    break;
-                }
-                if status == 0 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_micros(50));
+            if ok && !unsafe { cl.wait_event(queue, event) } {
+                ok = false;
             }
             unsafe { (cl.ReleaseEvent)(event) };
         }
@@ -1678,27 +2001,48 @@ fn bytes<T: Copy>(values: &[T]) -> &[u8] {
 
 const SEARCH: &str = include_str!("search.cl");
 
-const SWEEPS: usize = 4;
-
 const EXPAND: &str = r"
-__kernel void expand(__global uchar *plane, long pitch, long height) {
-    long size = pitch * height;
-    long item = get_global_id(0);
-    if (item >= 3 * size) return;
-    int k = (int)(item / size) + 1;
-    long i = item % size;
-    long y = i / pitch, x = i % pitch;
+inline uchar exp_p0(__global const uchar *p0, long size, long j) {
+    if (j < size) return p0[j];
+    long k = j - size;
+    return rhadd(p0[k], p0[k + 1]);
+}
+
+__kernel void expand(__global uchar *plane, int pitch, int height) {
+    int x = (int)get_global_id(0) * 4;
+    int y = (int)get_global_id(1);
+    if (x >= pitch || y >= height) return;
+    long p = (long)pitch;
+    long size = p * (long)height;
     __global const uchar *p0 = plane;
-    #define P0(j) ((j) < size ? (int)p0[j] : ((int)p0[(j) - size] + (int)p0[(j) - size + 1] + 1) >> 1)
-    int value;
-    if (k == 1) {
-        value = (P0(i) + P0(i + 1) + 1) >> 1;
-    } else if (k == 2) {
-        value = y == 0 ? (int)p0[x] : (P0(i) + P0(i + pitch) + 1) >> 1;
-    } else {
-        value = y == 0 ? (int)p0[x + 1] : (P0(i) + P0(i + pitch + 1) + 1) >> 1;
+    if (y > 0 && y < height - 1 && x + 4 <= pitch && (y < height - 2 || x + 4 < pitch)) {
+        long i = (long)y * p + x;
+        uchar4 a0 = vload4(0, p0 + i);
+        uchar4 a1 = (uchar4)(a0.yzw, p0[i + 4]);
+        uchar4 b0 = vload4(0, p0 + i + p);
+        uchar4 b1 = (uchar4)(b0.yzw, p0[i + p + 4]);
+        vstore4(rhadd(a0, a1), 0, plane + size + i);
+        vstore4(rhadd(a0, b0), 0, plane + 2 * size + i);
+        vstore4(rhadd(a0, b1), 0, plane + 3 * size + i);
+        return;
     }
-    plane[k * size + i] = (uchar)value;
+    if (y == 0 && height >= 2 && x + 4 <= pitch) {
+        uchar4 a0 = vload4(0, p0 + x);
+        uchar4 a1 = (uchar4)(a0.yzw, p0[x + 4]);
+        vstore4(rhadd(a0, a1), 0, plane + size + x);
+        vstore4(a0, 0, plane + 2 * size + x);
+        vstore4(a1, 0, plane + 3 * size + x);
+        return;
+    }
+    long row = (long)y * p;
+    int end = min(x + 4, pitch);
+    for (int cx = x; cx < end; cx++) {
+        long i = row + cx;
+        uchar c0 = p0[i];
+        plane[size + i] = rhadd(c0, exp_p0(p0, size, i + 1));
+        plane[2 * size + i] = y == 0 ? p0[cx] : rhadd(c0, exp_p0(p0, size, i + p));
+        plane[3 * size + i] = y == 0 ? p0[cx + 1] : rhadd(c0, exp_p0(p0, size, i + p + 1));
+    }
 }
 ";
 
@@ -1728,37 +2072,86 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
     return base + (long)(y >> bits) * pitch + (x >> bits) + index * pitch * height;
 }
 
-inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
-    int d[4][4];
-    for (int y = 0; y < 4; y++) {
-        long row = offset + (long)y * pitch;
-        if (row >= 0 && row + 4 <= length) {
-            int4 r = convert_int4(vload4(0, data + row));
-            d[y][0] = r.x; d[y][1] = r.y; d[y][2] = r.z; d[y][3] = r.w;
-        } else {
-            for (int x = 0; x < 4; x++) d[y][x] = fetch(data, length, row + x);
-        }
-        for (int x = 0; x < 4; x++) d[y][x] = src[y * 4 + x] - d[y][x];
+inline uint had4_row(int4 v) {
+    int a0 = v.x + v.y, a1 = v.z + v.w;
+    int b0 = v.x - v.y, b1 = v.z - v.w;
+    return (uint)(max(abs(a0), abs(a1)) + max(abs(b0), abs(b1)));
+}
+
+inline uint tile_cost4(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
     }
 #if SATD
-    for (int y = 0; y < 4; y++) {
-        int s0 = d[y][0] + d[y][1], s1 = d[y][2] + d[y][3];
-        int d0 = d[y][0] - d[y][1], d1 = d[y][2] - d[y][3];
-        d[y][0] = s0 + s1; d[y][1] = s0 - s1; d[y][2] = d0 + d1; d[y][3] = d0 - d1;
-    }
-    uint total = 0;
-    for (int x = 0; x < 4; x++) {
-        int s0 = d[0][x] + d[1][x], s1 = d[2][x] + d[3][x];
-        int d0 = d[0][x] - d[1][x], d1 = d[2][x] - d[3][x];
-        total += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
-    }
-    return total / 2;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    return had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
 #else
-    uint total = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) total += abs(d[y][x]);
-    return total;
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
 #endif
+}
+
+#if SATD && defined(SAD_GATED_SATD)
+inline uint tile_sad4_only(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
+    }
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
+}
+
+inline uint tile_cost4_gated(int4 s0, int4 s1, int4 s2, int4 s3, __global const uchar *data, long length, long offset, long pitch, uint best_raw, uint *out_raw) {
+    int4 r0, r1, r2, r3;
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
+    }
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    uint raw = t.x + t.y + t.z + t.w;
+    *out_raw = raw;
+    if (raw * 4u > best_raw * 5u) return 2147483647u;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    return had4_row(a0 + a1) + had4_row(a0 - a1) + had4_row(b0 + b1) + had4_row(b0 - b1);
+}
+#endif
+
+inline uint tile_cost(const int *src, __global const uchar *data, long length, long offset, long pitch) {
+    return tile_cost4(
+        (int4)(src[0], src[1], src[2], src[3]),
+        (int4)(src[4], src[5], src[6], src[7]),
+        (int4)(src[8], src[9], src[10], src[11]),
+        (int4)(src[12], src[13], src[14], src[15]),
+        data, length, offset, pitch);
 }
 
 #if S
@@ -1788,7 +2181,7 @@ inline int outside(int v, int low, int high) {
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
-            __global const long *p, __global const SEEDT *seed, __global uint2 *out,
+            __constant long *p, __global const SEEDT *seed, __global uint2 *out,
             __global const OVT *overrides
 #ifdef DEV
             , int seed_off, int out_off
@@ -1798,17 +2191,18 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     seed += seed_off;
     out += out_off;
 #endif
-    long block = get_global_id(0);
-    if (block >= p[17]) return;
+    int block = (int)get_global_id(0);
+    if (block >= (int)p[17]) return;
     int fw = (int)p[18], fh = (int)p[19], blk_x = (int)p[20], step_x = (int)p[21], step_y = (int)p[22];
     int radius = (int)p[23], bad_sad = (int)p[24], lambda = (int)p[25], diagonal = (int)p[26];
     int pnew = (int)p[27], pel = (int)p[28], count = (int)p[29];
     long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
     long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
-    int x0 = (int)(block % blk_x) * step_x, y0 = (int)(block / blk_x) * step_y;
+    int bx = block % blk_x, by = block / blk_x;
+    int x0 = bx * step_x, y0 = by * step_y;
     int cx = (int)p[33], cy = (int)p[34], norm = (int)p[35];
     int odd_x = (int)p[36], even_x = (int)p[37], odd_y = (int)p[38], even_y = (int)p[39], flat = (int)p[40];
-    int ki = min((int)(block % blk_x), 2 * cx - 1), kj = min((int)(block / blk_x), 2 * cy - 1);
+    int ki = min(bx, 2 * cx - 1), kj = min(by, 2 * cy - 1);
     int off_x = -1 + 2 * (ki & 1), off_y = -1 + 2 * (kj & 1);
     int edge_x = ki == 0 || ki >= 2 * cx - 1, edge_y = kj == 0 || kj >= 2 * cy - 1;
     int near_x = ki / 2 + off_x, near_y = kj / 2 + off_y;
@@ -1841,8 +2235,17 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     py = (int)(short)py;
     vsad >>= 6;
     int sum = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, p[30] + (long)(y0 + y) * psy + x0 + x);
+    long avg_at = p[30] + (long)y0 * psy + x0;
+    if (avg_at >= 0 && avg_at + 3 * psy + 4 <= lsy) {
+        int4 a = convert_int4(vload4(0, sy + avg_at))
+               + convert_int4(vload4(0, sy + avg_at + psy))
+               + convert_int4(vload4(0, sy + avg_at + 2 * psy))
+               + convert_int4(vload4(0, sy + avg_at + 3 * psy));
+        sum = a.x + a.y + a.z + a.w;
+    } else {
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) sum += fetch(sy, lsy, avg_at + (long)y * psy + x);
+    }
     int average = sum >> 4;
     int best_x = px, best_y = py, bsad = vsad;
     if (bsad > bad_sad) {
@@ -1882,22 +2285,47 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                 csrc_y = src_y >> S;
             }
         }
-        int src_luma[16], src_u[CW * CW], src_v[CW * CW];
+        int4 sy0, sy1, sy2, sy3;
         long luma_at = p[30] + (long)src_y * psy + src_x;
-        for (int b = 0; b < 16; b++) src_luma[b] = fetch(sy, lsy, luma_at + (long)(b >> 2) * psy + (b & 3));
+        if (luma_at >= 0 && luma_at + 3 * psy + 4 <= lsy) {
+            sy0 = convert_int4(vload4(0, sy + luma_at));
+            sy1 = convert_int4(vload4(0, sy + luma_at + psy));
+            sy2 = convert_int4(vload4(0, sy + luma_at + 2 * psy));
+            sy3 = convert_int4(vload4(0, sy + luma_at + 3 * psy));
+        } else {
+            sy0 = (int4)(fetch(sy, lsy, luma_at), fetch(sy, lsy, luma_at + 1), fetch(sy, lsy, luma_at + 2), fetch(sy, lsy, luma_at + 3));
+            long o1 = luma_at + psy, o2 = luma_at + 2 * psy, o3 = luma_at + 3 * psy;
+            sy1 = (int4)(fetch(sy, lsy, o1), fetch(sy, lsy, o1 + 1), fetch(sy, lsy, o1 + 2), fetch(sy, lsy, o1 + 3));
+            sy2 = (int4)(fetch(sy, lsy, o2), fetch(sy, lsy, o2 + 1), fetch(sy, lsy, o2 + 2), fetch(sy, lsy, o2 + 3));
+            sy3 = (int4)(fetch(sy, lsy, o3), fetch(sy, lsy, o3 + 1), fetch(sy, lsy, o3 + 2), fetch(sy, lsy, o3 + 3));
+        }
+#ifndef NO_CHROMA
+        int src_u[CW * CW], src_v[CW * CW];
         long u_at = p[31] + (long)csrc_y * psu + csrc_x, v_at = p[32] + (long)csrc_y * psv + csrc_x;
         for (int b = 0; b < CW * CW; b++) {
             src_u[b] = fetch(su, lsu, u_at + (long)(b / CW) * psu + b % CW);
             src_v[b] = fetch(sv, lsv, v_at + (long)(b / CW) * psv + b % CW);
         }
+#endif
         int ref_x = pos_x * pel, ref_y = pos_y * pel, cref_x = cpos_x * pel, cref_y = cpos_y * pel;
-#define LUMA(vx, vy) ((int)tile_cost(src_luma, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
+#define LUMA(vx, vy) ((int)tile_cost4(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + (vx), ref_y + (vy)), pry))
+#ifdef NO_CHROMA
+#define CHROMA(vx, vy) 0
+#else
 #define CHROMA(vx, vy) chroma_value(src_u, src_v, ru, rv, lru, lrv, pru, prv, subpel(p[13], pru, p[15], pel, cref_x + ((vx) >> S), cref_y + ((vy) >> S)))
+#endif
         bsad = LUMA(px, py) + CHROMA(px, py);
         int min_cost = bsad;
+#if SATD && defined(SAD_GATED_SATD)
+        uint best_raw = tile_sad4_only(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + px, ref_y + py), pry);
+#endif
         int min_x = max(px - radius, low_x), max_x = min(px + radius, high_x - 1);
         int min_y = max(py - radius, low_y), max_y = min(py + radius, high_y - 1);
+#ifdef EARLY_EXIT
+        if (bsad > 16 && min_x <= max_x && min_y <= max_y) {
+#else
         if (min_x <= max_x && min_y <= max_y) {
+#endif
             for (int vy = min_y; vy <= max_y; vy++) {
                 int dy = py - vy;
                 uint dy2 = (uint)dy * (uint)dy;
@@ -1908,7 +2336,14 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                     if (cost >= min_cost) continue;
                     int at = pel == 1 ? luma_x : vx;
                     if (pel == 1) luma_x++;
+#if SATD && defined(SAD_GATED_SATD)
+                    uint cand_raw = 0;
+                    uint sad_u = tile_cost4_gated(sy0, sy1, sy2, sy3, ry, lry, subpel(p[12], pry, p[14], pel, ref_x + at, ref_y + vy), pry, best_raw, &cand_raw);
+                    if (sad_u == 2147483647u) continue;
+                    int sad = (int)sad_u;
+#else
                     int sad = LUMA(at, vy);
+#endif
                     cost = (int)((uint)cost + (uint)sad + (uint)(((int)((uint)pnew * (uint)sad)) >> 8));
                     if (cost >= min_cost) continue;
                     int uv = CHROMA(vx, vy);
@@ -1918,6 +2353,9 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
                     best_y = vy;
                     bsad = sad + uv;
                     min_cost = cost;
+#if SATD && defined(SAD_GATED_SATD)
+                    best_raw = cand_raw;
+#endif
                 }
             }
         }
@@ -1952,57 +2390,53 @@ inline long subpel(long base, long pitch, long height, int pel, int x, int y) {
     return base + (long)(y >> bits) * pitch + (x >> bits) + index * pitch * height;
 }
 
+inline uint had4_row_k(int4 v) {
+    int a0 = v.x + v.y, a1 = v.z + v.w;
+    int b0 = v.x - v.y, b1 = v.z - v.w;
+    return (uint)(max(abs(a0), abs(a1)) + max(abs(b0), abs(b1)));
+}
+
 inline uint tile_cost(__local const uchar *src, int spitch, __global const uchar *data, long length,
                       long offset, long pitch) {
-    int d[4][4];
-    for (int y = 0; y < 4; y++) {
-        long row = offset + (long)y * pitch;
-        int4 r;
-        if (row >= 0 && row + 4 <= length) {
-            r = convert_int4(vload4(0, data + row));
-        } else {
-            r = (int4)(fetch(data, length, row), fetch(data, length, row + 1),
-                       fetch(data, length, row + 2), fetch(data, length, row + 3));
-        }
-        __local const uchar *s = src + y * spitch;
-        d[y][0] = (int)s[0] - r.x;
-        d[y][1] = (int)s[1] - r.y;
-        d[y][2] = (int)s[2] - r.z;
-        d[y][3] = (int)s[3] - r.w;
+    int4 r0, r1, r2, r3;
+    int4 s0 = (int4)(src[0], src[1], src[2], src[3]);
+    int4 s1 = (int4)(src[spitch], src[spitch + 1], src[spitch + 2], src[spitch + 3]);
+    int4 s2 = (int4)(src[2 * spitch], src[2 * spitch + 1], src[2 * spitch + 2], src[2 * spitch + 3]);
+    int4 s3 = (int4)(src[3 * spitch], src[3 * spitch + 1], src[3 * spitch + 2], src[3 * spitch + 3]);
+    if (offset >= 0 && offset + 3 * pitch + 4 <= length) {
+        r0 = s0 - convert_int4(vload4(0, data + offset));
+        r1 = s1 - convert_int4(vload4(0, data + offset + pitch));
+        r2 = s2 - convert_int4(vload4(0, data + offset + 2 * pitch));
+        r3 = s3 - convert_int4(vload4(0, data + offset + 3 * pitch));
+    } else {
+        long o0 = offset, o1 = offset + pitch, o2 = offset + 2 * pitch, o3 = offset + 3 * pitch;
+        r0 = s0 - (int4)(fetch(data, length, o0), fetch(data, length, o0 + 1), fetch(data, length, o0 + 2), fetch(data, length, o0 + 3));
+        r1 = s1 - (int4)(fetch(data, length, o1), fetch(data, length, o1 + 1), fetch(data, length, o1 + 2), fetch(data, length, o1 + 3));
+        r2 = s2 - (int4)(fetch(data, length, o2), fetch(data, length, o2 + 1), fetch(data, length, o2 + 2), fetch(data, length, o2 + 3));
+        r3 = s3 - (int4)(fetch(data, length, o3), fetch(data, length, o3 + 1), fetch(data, length, o3 + 2), fetch(data, length, o3 + 3));
     }
 #if SATD
-    for (int y = 0; y < 4; y++) {
-        int s0 = d[y][0] + d[y][1], s1 = d[y][2] + d[y][3];
-        int d0 = d[y][0] - d[y][1], d1 = d[y][2] - d[y][3];
-        d[y][0] = s0 + s1; d[y][1] = s0 - s1; d[y][2] = d0 + d1; d[y][3] = d0 - d1;
-    }
-    uint total = 0;
-    for (int x = 0; x < 4; x++) {
-        int s0 = d[0][x] + d[1][x], s1 = d[2][x] + d[3][x];
-        int d0 = d[0][x] - d[1][x], d1 = d[2][x] - d[3][x];
-        total += abs(s0 + s1) + abs(s0 - s1) + abs(d0 + d1) + abs(d0 - d1);
-    }
-    return total;
+    int4 a0 = r0 + r1, a1 = r2 + r3;
+    int4 b0 = r0 - r1, b1 = r2 - r3;
+    return had4_row_k(a0 + a1) + had4_row_k(a0 - a1) + had4_row_k(b0 + b1) + had4_row_k(b0 - b1);
 #else
-    uint total = 0;
-    for (int y = 0; y < 4; y++)
-        for (int x = 0; x < 4; x++) total += abs(d[y][x]);
-    return total;
+    uint4 t = abs(r0) + abs(r1) + abs(r2) + abs(r3);
+    return t.x + t.y + t.z + t.w;
 #endif
 }
 
 __kernel __attribute__((reqd_work_group_size(64, 1, 1)))
 void recalc(__global const uchar *sy, __global const uchar *su, __global const uchar *sv,
             __global const uchar *ry, __global const uchar *ru, __global const uchar *rv,
-            __global const long *p, __global const int *records, __global int4 *bests) {
+            __constant long *p, __global const int *records, __global int4 *bests) {
     __local uchar src_luma[W * H];
     __local uchar src_u[(W >> S) * (H >> S)];
     __local uchar src_v[(W >> S) * (H >> S)];
     __local uint acc_luma[MAX_SLOTS], acc_u[MAX_SLOTS], acc_v[MAX_SLOTS];
     __local int sum_average;
-    long block = get_group_id(0);
+    int block = (int)get_group_id(0);
     int lid = get_local_id(0);
-    long slots = p[17];
+    int slots = (int)p[17];
     int pnew = (int)p[19], pel = (int)p[20];
     long lsy = p[0], lsu = p[1], lsv = p[2], psy = p[3], psu = p[4], psv = p[5];
     long lry = p[6], lru = p[7], lrv = p[8], pry = p[9], pru = p[10], prv = p[11];
@@ -2027,6 +2461,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
         }
         src_luma[b] = (uchar)value;
     }
+#ifndef NO_CHROMA
     if (!negative) {
         for (int b = lid; b < cw * ch; b += 64) {
             int y = b / cw, x = b % cw;
@@ -2034,6 +2469,7 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
             src_v[b] = vs == NONE_V ? 0 : (uchar)fetch(sv, lsv, vs + (long)y * psv + x);
         }
     }
+#endif
     barrier(CLK_LOCAL_MEM_FENCE);
     if (r[4] != NONE_V) {
         int part = 0;
@@ -2045,7 +2481,11 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     int ww = max_x - min_x + 1, wh = max_y - min_y + 1;
     int px = LO(r[7]), py = HI(r[7]);
     int luma_tiles = (bw / 4) * (bh / 4);
+#ifdef NO_CHROMA
+    int chroma_tiles = 0;
+#else
     int chroma_tiles = negative ? 0 : (cw / 4) * (ch / 4);
+#endif
     int per_slot = luma_tiles + 2 * chroma_tiles;
     if (bad) {
         for (int task = lid; task < slots * per_slot; task += 64) {
@@ -2088,13 +2528,8 @@ void recalc(__global const uchar *sy, __global const uchar *su, __global const u
     if (r[4] != NONE_V && bh >= 4) average = sum_average >> (31 - clz(bw * bh));
     int bx = px, by = py, bsad = r[10];
     if (bad) {
-#if SATD
-#define LUMA(s) ((int)(acc_luma[s] / 2))
-#define CHROMA(s) ((int)((acc_u[s] / 2 + acc_v[s] / 2) << (2 * S)))
-#else
 #define LUMA(s) ((int)acc_luma[s])
 #define CHROMA(s) ((int)((acc_u[s] + acc_v[s]) << (2 * S)))
-#endif
         bsad = (int)((uint)LUMA(0) + (uint)CHROMA(0));
         int min_cost = bsad;
         uint lambda = (uint)(r[11] >> 2);

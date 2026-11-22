@@ -24,12 +24,18 @@ pub struct Layer {
     fit: Owned,
     cover: Owned,
     gaps: Vec<u8>,
+    empty: bool,
 }
 
 impl Layer {
     #[must_use]
     pub fn gaps(&self) -> &[u8] {
         &self.gaps
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.empty
     }
 }
 
@@ -51,7 +57,7 @@ pub(super) struct LayerState {
     queue: ClCommandQueue,
     kernels: [ClKernel; 4],
     rough: ImageSlot,
-    vectors: [ImageSlot; 4],
+    vectors: [ImageSlot; 6],
     found: (ClMem, usize),
     stats: Vec<(i64, Arc<Owned>, i32)>,
     fits: Vec<(i64, Arc<Layer>)>,
@@ -77,12 +83,28 @@ impl LayerState {
         self.fits.push((chunk, Arc::clone(fit)));
     }
 
+    fn cached(&mut self, chunk: i64, cap: usize) -> Option<Arc<Layer>> {
+        if let Some(pos) = self.fits.iter().position(|(key, _)| *key == chunk) {
+            let entry = self.fits.remove(pos);
+            let fit = Arc::clone(&entry.1);
+            self.fits.push(entry);
+            return Some(fit);
+        }
+        let fit = self
+            .held
+            .iter()
+            .find(|(key, _)| *key == chunk)
+            .and_then(|(_, fit)| fit.upgrade())?;
+        self.keep(chunk, &fit, cap);
+        Some(fit)
+    }
+
     pub(super) const fn new() -> Self {
         Self {
             queue: std::ptr::null_mut(),
             kernels: [std::ptr::null_mut(); 4],
             rough: ImageSlot::EMPTY,
-            vectors: [ImageSlot::EMPTY; 4],
+            vectors: [ImageSlot::EMPTY; 6],
             found: (std::ptr::null_mut(), 0),
             stats: Vec::new(),
             fits: Vec::new(),
@@ -159,8 +181,17 @@ impl GpuContext {
         Some(model)
     }
 
-    pub fn layer_hold(&self, chunk: i32, last: i32, held: &mut LayerHeld) -> Vec<i32> {
-        let near = (chunk - 1).max(0)..=(chunk + 1).min(last);
+    pub fn layer_hold(
+        &self,
+        chunk: i32,
+        last: i32,
+        step: i32,
+        held: &mut LayerHeld,
+    ) -> Vec<i32> {
+        let step = step.max(1);
+        let near = [chunk - step, chunk, chunk + step]
+            .into_iter()
+            .filter(|&c| c >= 0 && c <= last);
         let Ok(state) = self.layer.lock() else {
             return near.collect();
         };
@@ -202,7 +233,19 @@ impl GpuContext {
         }
     }
 
-    unsafe fn run(&self, queue: ClCommandQueue, kernel: ClKernel, size: [usize; 2]) -> bool {
+    unsafe fn run(
+        &self,
+        queue: ClCommandQueue,
+        kernel: ClKernel,
+        size: [usize; 2],
+        waits: &[super::ClEvent],
+    ) -> bool {
+        let wait_count = u32::try_from(waits.len()).unwrap_or(0);
+        let wait_ptr = if wait_count > 0 {
+            waits.as_ptr().cast()
+        } else {
+            std::ptr::null()
+        };
         unsafe {
             self.note((self.cl.EnqueueNDRangeKernel)(
                 queue,
@@ -211,8 +254,8 @@ impl GpuContext {
                 std::ptr::null(),
                 size.as_ptr(),
                 std::ptr::null(),
-                0,
-                std::ptr::null(),
+                wait_count,
+                wait_ptr,
                 std::ptr::null_mut(),
             )) == CL_SUCCESS
         }
@@ -263,9 +306,9 @@ impl GpuContext {
         let (queue, kernel) = (state.queue, state.kernels[0]);
         let mut frames: Vec<ClMem> = group.iter().map(|pair| pair.first.bufs()[1].0).collect();
         frames.push(group[group.len() - 1].second.bufs()[1].0);
-        frames.resize(5, frames[0]);
+        frames.resize(7, frames[0]);
         unsafe {
-            let mut vectors = [std::ptr::null_mut(); 4];
+            let mut vectors = [std::ptr::null_mut(); 6];
             for (index, pair) in group.iter().enumerate() {
                 let image =
                     self.ensure_image(&mut state.vectors[index], grid.0, grid.1, CL_UNORM_INT16)?;
@@ -295,7 +338,7 @@ impl GpuContext {
                     *image = spare;
                 }
             }
-            let mut waits = Vec::with_capacity(5);
+            let mut waits = Vec::with_capacity(7);
             for pair in group {
                 for handle in [&pair.first, &pair.second] {
                     let event = handle.bufs()[1].1;
@@ -303,12 +346,6 @@ impl GpuContext {
                         waits.push(event);
                     }
                 }
-            }
-            if !waits.is_empty()
-                && (self.cl.WaitForEvents)(waits.len() as ClUint, waits.as_ptr().cast())
-                    != CL_SUCCESS
-            {
-                return None;
             }
             let luma = usize::try_from(params[0].width * params[0].height).ok()?;
             let chroma = usize::try_from(params[1].width * params[1].height).ok()?;
@@ -330,12 +367,13 @@ impl GpuContext {
                     usize::try_from(p.width).ok()?,
                     usize::try_from(p.height).ok()?,
                 ];
-                let ok = self.set(kernel, 10, &p)
-                    && self.set(kernel, 11, &i32::try_from(base).ok()?)
-                    && self.set(kernel, 12, &channels)
-                    && self.set(kernel, 13, &reset)
-                    && self.set(kernel, 14, &pairs)
-                    && self.run(queue, kernel, size);
+                let wait = if plane == 0 { &waits[..] } else { &[] };
+                let ok = self.set(kernel, 14, &p)
+                    && self.set(kernel, 15, &i32::try_from(base).ok()?)
+                    && self.set(kernel, 16, &channels)
+                    && self.set(kernel, 17, &reset)
+                    && self.set(kernel, 18, &pairs)
+                    && self.run(queue, kernel, size, wait);
                 if !ok {
                     return None;
                 }
@@ -349,6 +387,7 @@ impl GpuContext {
         &self,
         chunk: i64,
         last: i64,
+        step: i64,
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
@@ -360,15 +399,19 @@ impl GpuContext {
         if self.depth > 8 {
             return Ok(None);
         }
-        self.fit_chunk(chunk, last, params, grid, limit, proof, strict, held, pairs)
-            .map(Some)
-            .ok_or(Failed)
+        self.fit_chunk(
+            chunk, last, step, params, grid, limit, proof, strict, held, pairs,
+        )
+        .map(Some)
+        .ok_or(Failed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fit_chunk(
         &self,
         chunk: i64,
         last: i64,
+        step: i64,
         params: &[KernelParams; 3],
         grid: (usize, usize),
         limit: f32,
@@ -390,21 +433,37 @@ impl GpuContext {
         } else {
             (3, 2)
         };
-        let mut state = self.layer.lock().ok()?;
-        if let Some(pos) = state.fits.iter().position(|(key, _)| *key == chunk) {
-            let entry = state.fits.remove(pos);
-            let fit = Arc::clone(&entry.1);
-            state.fits.push(entry);
-            return Some(fit);
+        let step = step.max(1);
+        let keys = [chunk - step, chunk, chunk + step];
+        let missing = {
+            let mut state = self.layer.lock().ok()?;
+            if let Some(fit) = state.cached(chunk, fit_cap) {
+                return Some(fit);
+            }
+            keys.map(|key| {
+                key >= 0
+                    && key <= last
+                    && !held
+                        .stats
+                        .iter()
+                        .chain(&state.stats)
+                        .any(|(k, _, _)| *k == key)
+            })
+        };
+        let mut prepared = [None, None, None];
+        for (slot, (key, need)) in prepared.iter_mut().zip(keys.into_iter().zip(missing)) {
+            if need {
+                *slot = Some(pairs(key)?);
+            }
         }
-        let gone = state.held.iter().find(|(key, _)| *key == chunk);
-        if let Some(fit) = gone.and_then(|(_, fit)| fit.upgrade()) {
-            state.keep(chunk, &fit, fit_cap);
+        let mut state = self.layer.lock().ok()?;
+        if let Some(fit) = state.cached(chunk, fit_cap) {
             return Some(fit);
         }
         unsafe { self.layer_setup(&mut state) }?;
         let mut parts = [None, None, None];
-        for (slot, key) in parts.iter_mut().zip([chunk - 1, chunk, chunk + 1]) {
+        let mut kept_pairs = Vec::new();
+        for ((slot, key), pre) in parts.iter_mut().zip(keys).zip(prepared) {
             if key < 0 || key > last {
                 continue;
             }
@@ -417,13 +476,16 @@ impl GpuContext {
                 *slot = Some((Arc::clone(&found.1), found.2));
                 continue;
             }
-            let pairs = pairs(key)?;
-            // reuse an expired stats buffer before allocating a new one
+            let pairs = match pre {
+                Some(pairs) => pairs,
+                None => pairs(key)?,
+            };
             let reused = (state.stats.len() >= stats_cap)
                 .then(|| {
-                    state.stats.iter().position(|(k, sums, _)| {
-                        !(chunk - 1..=chunk + 1).contains(k) && Arc::strong_count(sums) == 1
-                    })
+                    state
+                        .stats
+                        .iter()
+                        .position(|(k, sums, _)| !keys.contains(k) && Arc::strong_count(sums) == 1)
                 })
                 .flatten()
                 .map(|index| state.stats.remove(index).1);
@@ -438,16 +500,17 @@ impl GpuContext {
             };
             let mem = sums.0;
             let stats = pairs
-                .chunks(4)
+                .chunks(6)
                 .enumerate()
                 .try_for_each(|(index, group)| unsafe {
                     self.layer_stats(&mut state, mem, group, params, grid, index == 0)
                 });
-            if unsafe { self.note((self.cl.Finish)(state.queue)) } != CL_SUCCESS || stats.is_none()
-            {
+            if stats.is_none() {
+                unsafe { self.note((self.cl.Finish)(state.queue)) };
                 return None;
             }
             let count = i32::try_from(pairs.len() * 2).ok()?;
+            kept_pairs.push(pairs);
             let over = (state.stats.len() + 1).saturating_sub(stats_cap);
             state.stats.drain(..over);
             state.stats.push((key, Arc::clone(&sums), count));
@@ -461,6 +524,7 @@ impl GpuContext {
             fit: Owned(fit.mem, self.cl.ReleaseMemObject),
             cover: Owned(cover.mem, self.cl.ReleaseMemObject),
             gaps: Vec::new(),
+            empty: false,
         };
         std::mem::forget(fit);
         std::mem::forget(cover);
@@ -486,15 +550,15 @@ impl GpuContext {
                 && self.set(fit_kernel, 11, &params[1].height)
                 && self.set(fit_kernel, 12, &i32::from(strict))
                 && self.set(fit_kernel, 13, &proof)
-                && self.run(state.queue, fit_kernel, [width, height])
+                && self.run(state.queue, fit_kernel, [width, height], &[])
                 && self.set(clean_kernel, 0, &rough)
                 && self.set(clean_kernel, 1, &made.fit.0)
-                && self.run(state.queue, clean_kernel, [width, height])
+                && self.run(state.queue, clean_kernel, [width, height], &[])
                 && self.set(cover_kernel, 0, &made.fit.0)
                 && self.set(cover_kernel, 1, &found)
                 && self.set(cover_kernel, 2, &w)
                 && self.set(cover_kernel, 3, &h)
-                && self.run(state.queue, cover_kernel, [cells.0, cells.1])
+                && self.run(state.queue, cover_kernel, [cells.0, cells.1], &[])
                 && self.note((self.cl.EnqueueReadBuffer)(
                     state.queue,
                     found,
@@ -507,29 +571,40 @@ impl GpuContext {
                     std::ptr::null_mut(),
                 )) == CL_SUCCESS;
             if !ready {
+                self.note((self.cl.Finish)(state.queue));
                 return None;
             }
+            drop(kept_pairs);
+            let mut empty = true;
             for gap in &mut gaps {
-                *gap = if *gap == 0 { 255 } else { 0 };
+                if *gap == 0 {
+                    *gap = 255;
+                } else {
+                    *gap = 0;
+                    empty = false;
+                }
             }
-            svpflow_core::layer::distances(&mut gaps, cells.0);
-            let origin = [0usize; 3];
-            let region = [cells.0, cells.1, 1];
-            if self.note((self.cl.EnqueueWriteImage)(
-                state.queue,
-                made.cover.0,
-                CL_TRUE,
-                origin.as_ptr(),
-                region.as_ptr(),
-                cells.0,
-                0,
-                gaps.as_ptr().cast(),
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )) != CL_SUCCESS
-            {
-                return None;
+            made.empty = empty;
+            if !empty {
+                svpflow_core::layer::distances(&mut gaps, cells.0);
+                let origin = [0usize; 3];
+                let region = [cells.0, cells.1, 1];
+                if self.note((self.cl.EnqueueWriteImage)(
+                    state.queue,
+                    made.cover.0,
+                    CL_TRUE,
+                    origin.as_ptr(),
+                    region.as_ptr(),
+                    cells.0,
+                    0,
+                    gaps.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )) != CL_SUCCESS
+                {
+                    return None;
+                }
             }
         }
         made.gaps = gaps;

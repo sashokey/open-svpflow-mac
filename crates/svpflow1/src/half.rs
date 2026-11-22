@@ -34,6 +34,7 @@ struct State {
     vi: vs::VideoInfo,
     header: Box<[i32; 15]>,
     multiply: i32,
+    luma_only: bool,
     _live: svpflow_host::Live,
 }
 
@@ -109,11 +110,15 @@ pub(crate) unsafe extern "system" fn create_halve(
     }
     vi.width /= 2;
     vi.height /= 2;
+    let opt = unsafe { crate::super_filter::read_opt(input, vsapi) };
+    let luma_only = crate::super_opts::SuperOpts::from_opt(opt.as_ref(), vi.width, vi.height)
+        .is_ok_and(crate::super_opts::SuperOpts::luma_only);
     let state = State {
         node,
         vi,
         header: Box::new([0; 15]),
         multiply: 0,
+        luma_only,
         _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe { register(input, output, core, vsapi, c"SVHalve", state, halve_frame) };
@@ -169,6 +174,7 @@ pub(crate) unsafe extern "system" fn create_double_vectors(
         vi,
         header,
         multiply,
+        luma_only: false,
         _live: svpflow_host::Live::new(crate::abi::osvp_plugin_stop),
     };
     unsafe {
@@ -312,7 +318,8 @@ unsafe fn halve(state: &State, api: &Api, source: vs::ConstRaw, output: vs::Raw)
     #[cfg(target_arch = "x86_64")]
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
     let (x_div, y_div) = video_format::chroma_divisors(&state.vi);
-    for plane in 0..3 {
+    let planes = if state.luma_only { 1 } else { 3 };
+    for plane in 0..planes {
         let (x_div, y_div) = if plane == 0 { (1, 1) } else { (x_div, y_div) };
         let width = state.vi.width as usize / x_div;
         let height = state.vi.height as usize / y_div;

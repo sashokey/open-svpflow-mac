@@ -86,6 +86,11 @@ pub extern "C" fn osvp_set_threads(count: i32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn osvp_cl_context() -> *mut c_void {
+    svpflow_host::context::any_shared()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn osvp_create(plugin_dir: *const c_char) -> *mut Context {
     let directory = unsafe { plugin_dir.as_ref() }.map(|directory| {
         unsafe { CStr::from_ptr(directory) }
@@ -215,14 +220,22 @@ unsafe fn vectors(
         host.invoke(name, &input)
     };
     let clip = |node: &Arc<Node>| Value::Node(Arc::clone(node));
+    let super_text = unsafe { text(super_opt) };
+    let analyse_text = unsafe { text(analyse_opt) };
     let analysed = if half {
-        call(c"Halve", vec![(c"clip", clip(source))])?
-            .node(c"clip")
-            .ok_or_else(missing)?
+        call(
+            c"Halve",
+            vec![
+                (c"clip", clip(source)),
+                (c"opt", Value::Data(super_text.clone())),
+            ],
+        )?
+        .node(c"clip")
+        .ok_or_else(missing)?
     } else {
         Arc::clone(source)
     };
-    let options = Value::Data(unsafe { text(super_opt) });
+    let options = Value::Data(super_text);
     let mut supers = call(
         c"Super",
         vec![(c"clip", clip(&analysed)), (c"opt", options)],
@@ -234,7 +247,7 @@ unsafe fn vectors(
             (c"clip", clip(&supers.node(c"clip").ok_or_else(missing)?)),
             (c"sdata", Value::Int(sdata)),
             (c"src", clip(&analysed)),
-            (c"opt", Value::Data(unsafe { text(analyse_opt) })),
+            (c"opt", Value::Data(analyse_text)),
         ],
     )?;
     if half {
@@ -250,7 +263,11 @@ unsafe fn vectors(
         )?;
         if render {
             let gpu = (sdata >> 48) & 0xFF;
-            let options = CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default();
+            let options = if gpu == 1 {
+                c"{pel:1,lean:true,gpu:1}".to_owned()
+            } else {
+                CString::new(format!("{{pel:1,gpu:{gpu}}}")).unwrap_or_default()
+            };
             supers = call(
                 c"Super",
                 vec![(c"clip", clip(source)), (c"opt", Value::Data(options))],
