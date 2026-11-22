@@ -32,6 +32,10 @@ Open SVPflow brings motion-compensated frame interpolation to everyday movie pla
 - **Preserve the playback boundary.** Use local Unix-domain IPC for session control. Keep the launcher free of internet requests, telemetry and automatic updates. Dependency installation starts at the user's request, and external mpv retains its own capabilities.
 - **Verify the behavior users see.** Measure interpolation throughput separately from decoding and display. For window changes, check the native app on an isolated runner, including restored window sizes and scrolling in long settings panes. Publish packages after the automated build and extracted-app checks pass.
 
+## Publishing releases
+
+Use the same numbered `vN` for the GitHub tag and release title. Increment `N` for each release, including prereleases. Set the app bundle and ZIP version separately in `.github/release.json`. Publish through `.github/workflows/release.yml` and verify that the tag points to the tested commit and the downloaded ZIP matches the ARM64 CI package.
+
 ## Interpolation presets
 
 `Smooth` uses uniform interpolation, quarter-pixel motion vectors, 8-bit synthesis, and a 16-pixel motion-vector grid step. With the default native options this means 16×16 blocks with zero overlap. Imported native options can override the generated engine parameters. The target frame rate and performance settings are selected separately from the interpolation preset.

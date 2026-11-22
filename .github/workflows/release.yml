@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
+      package_version: ${{ steps.release.outputs.package_version }}
       draft: ${{ steps.release.outputs.draft }}
       prerelease: ${{ steps.release.outputs.prerelease }}
     steps:
@@ -32,7 +33,7 @@ jobs:
     needs: metadata
     uses: ./.github/workflows/ci.yml
     with:
-      version: ${{ needs.metadata.outputs.version }}
+      version: ${{ needs.metadata.outputs.package_version }}
 
   publish:
     needs: [metadata, test-build]
@@ -51,15 +52,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.version }}
           DRAFT: ${{ needs.metadata.outputs.draft }}
           PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
           python3 -c 'import json; from pathlib import Path; Path("release-notes.md").write_text(json.loads(Path(".github/release.json").read_text())["notes"], encoding="utf-8")'
           flags=(--draft)
           if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
-          gh release create "v$VERSION" dist/*.zip --target "$GITHUB_SHA" --title "v$VERSION" --notes-file release-notes.md "${flags[@]}"
-          gh release download "v$VERSION" --pattern '*.zip' --dir "$RUNNER_TEMP/release-verification"
+          gh release create "$RELEASE_TAG" dist/*.zip --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file release-notes.md "${flags[@]}"
+          gh release download "$RELEASE_TAG" --pattern '*.zip' --dir "$RUNNER_TEMP/release-verification"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -71,6 +72,8 @@ jobs:
               assert {name.split("/")[0] for name in archive.namelist()} == {"Open SVPflow.app"}
           PY
           if [ "$DRAFT" = false ]; then
-            gh release edit "v$VERSION" --draft=false --prerelease="$PRERELEASE"
+            flags=(--draft=false --prerelease="$PRERELEASE")
+            if [ "$PRERELEASE" = false ]; then flags+=(--latest); fi
+            gh release edit "$RELEASE_TAG" "${flags[@]}"
           fi
 

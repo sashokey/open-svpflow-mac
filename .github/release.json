@@ -1,6 +1,7 @@
 {
-  "version": "0.1.10",
+  "version": "v11",
+  "package_version": "0.1.11",
   "draft": false,
   "prerelease": false,
-  "notes": "## Changes\n\n- Accelerate both passes of six-tap cubic downsampling in Super with ARM64 NEON. The integer weights, rounding, and edge handling are preserved.\n- Precompute and reuse cubic motion-field sampling weights for supported 8-bit OpenCL shader 23 frames with a 16-pixel grid on Apple Silicon.\n- Add regression tests for SIMD pixel parity, shader selection, and OpenCL argument binding. All 7,200 reference frames, including synthesized frames, matched v0.1.9 byte for byte at 120 and 240 FPS.\n\nExtract the ZIP and open Open SVPflow.app on an Apple Silicon Mac running macOS 26 or later. See the README for setup and compatibility details."
+  "notes": "## Changes\n\n- Update the engine to upstream Open SVPflow 0.1.4 with VapourSynth 4 input and frame-rate fixes, safer OpenCL buffer handling, and lower memory use.\n- Bring in upstream CPU and GPU optimizations for motion analysis, cubic and FIR filters, interpolation, and OpenCL transfers. The new engine fast modes are opt-in.\n- Retain the macOS launcher and its playback settings, the signed motion-vector fix, and Apple Silicon optimizations for unaligned motion blocks, cubic interpolation, and paired chroma rendering.\n- Verify ARM64 packaging and playback with VapourSynth and mpv. On a short 720p Smooth regression clip, all 527 frames at 120 and 240 FPS matched the build before the second engine sync byte for byte.\n\nExtract the ZIP and open Open SVPflow.app on an Apple Silicon Mac running macOS 26 or later. The application version is `0.1.11`."
 }
