@@ -20,9 +20,16 @@ def verify(app):
     assert metadata["LSMinimumSystemVersion"] == "26.0"
     assert metadata["CFBundleExecutable"] == "OpenSVPflow"
     assert set(metadata["CFBundleLocalizations"]) == {"en", "zh-Hans", "hi", "es", "ar", "fr", "bn", "pt-PT", "id", "ur", "ru", "de", "ja"}
+    label = metadata["OpenSVPflowReleaseVersion"]
+    if label.startswith("v"):
+        assert metadata["CFBundleShortVersionString"] == label[1:] + ".0.0"
+        assert metadata["CFBundleVersion"] == label[1:]
     for locale in metadata["CFBundleLocalizations"]:
-        catalog = contents / "Resources" / (locale + ".lproj") / "Localizable.strings"
-        command("/usr/bin/plutil", "-lint", "--", str(catalog))
+        localization = contents / "Resources" / (locale + ".lproj")
+        command("/usr/bin/plutil", "-lint", "--", str(localization / "Localizable.strings"))
+        if label.startswith("v"):
+            localized_info = plistlib.loads((localization / "InfoPlist.strings").read_bytes())
+            assert localized_info["CFBundleShortVersionString"] == label, locale
     assert os.access(contents / "MacOS/OpenSVPflow", os.X_OK), "The extracted application executable lost its execute permission"
     assert not any(key.startswith("NS") and key.endswith("UsageDescription") for key in metadata)
     for name in ("README.md", "assets/OpenSVPflow-screenshot.png", "LICENSE", "THIRD_PARTY_NOTICES.md", "OpenSVPflow.icns", "StatusIconTemplate.png", "player/application.py", "player/settings_api.py", "player/session.py", "player/launch.py", "player/dependencies.py", "player/compat.lua", "player/graph.vpy"):

@@ -28,7 +28,7 @@ APP_NAME = "Open SVPflow.app"
 
 
 def validate_version(version):
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+    if not re.fullmatch(r"v[1-9][0-9]*|[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("Invalid release version")
 
 
@@ -56,7 +56,13 @@ def assemble_bundle(source, library, executable, icons, output, version):
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(origin, destination)
         destination.chmod(0o755 if relative == "MacOS/OpenSVPflow" else 0o644)
-    numeric = version.split("-", 1)[0]
+    numbered_release = version.startswith("v")
+    numeric = version[1:] + ".0.0" if numbered_release else version.split("-", 1)[0]
+    build_version = version[1:] if numbered_release else numeric
+    if numbered_release:
+        localized_info = plistlib.dumps({"CFBundleShortVersionString": version})
+        for locale in LOCALIZATIONS:
+            (contents / "Resources" / (locale + ".lproj") / "InfoPlist.strings").write_bytes(localized_info)
     metadata = {
         "CFBundleDevelopmentRegion": "en",
         "CFBundleLocalizations": list(LOCALIZATIONS),
@@ -67,7 +73,7 @@ def assemble_bundle(source, library, executable, icons, output, version):
         "CFBundlePackageType": "APPL",
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleShortVersionString": numeric,
-        "CFBundleVersion": numeric,
+        "CFBundleVersion": build_version,
         "OpenSVPflowReleaseVersion": version,
         "CFBundleIconFile": "OpenSVPflow.icns",
         "LSMinimumSystemVersion": "26.0",

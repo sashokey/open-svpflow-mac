@@ -19,9 +19,10 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
-      package_version: ${{ steps.release.outputs.package_version }}
       draft: ${{ steps.release.outputs.draft }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+      previous_commit: ${{ steps.release.outputs.previous_commit }}
+      previous_asset: ${{ steps.release.outputs.previous_asset }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -33,7 +34,7 @@ jobs:
     needs: metadata
     uses: ./.github/workflows/ci.yml
     with:
-      version: ${{ needs.metadata.outputs.package_version }}
+      version: ${{ needs.metadata.outputs.version }}
 
   publish:
     needs: [metadata, test-build]
@@ -55,25 +56,58 @@ jobs:
           RELEASE_TAG: ${{ needs.metadata.outputs.version }}
           DRAFT: ${{ needs.metadata.outputs.draft }}
           PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          PREVIOUS_COMMIT: ${{ needs.metadata.outputs.previous_commit }}
+          PREVIOUS_ASSET: ${{ needs.metadata.outputs.previous_asset }}
         run: |
           python3 -c 'import json; from pathlib import Path; Path("release-notes.md").write_text(json.loads(Path(".github/release.json").read_text())["notes"], encoding="utf-8")'
-          flags=(--draft)
-          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" dist/*.zip --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file release-notes.md "${flags[@]}"
-          gh release download "$RELEASE_TAG" --pattern '*.zip' --dir "$RUNNER_TEMP/release-verification"
-          python3 - <<'PY'
-          import os
+          archive="dist/open-svpflow-$RELEASE_TAG-arm64.zip"
+          asset_name="open-svpflow-$RELEASE_TAG-arm64.zip"
+          test -f "$archive"
+          if [ -n "$PREVIOUS_COMMIT" ]; then
+            tag_ref="repos/$GH_REPO/git/ref/tags/$RELEASE_TAG"
+            current_commit=$(gh api "$tag_ref" --jq '.object | select(.type == "commit") | .sha')
+            if [[ "$current_commit" != "$PREVIOUS_COMMIT" && "$current_commit" != "$GITHUB_SHA" ]]; then
+              echo "Release tag points to an unexpected commit" >&2
+              exit 1
+            fi
+            test "$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq 'select(.draft == false and (.immutable != true)) | .tag_name')" = "$RELEASE_TAG"
+            existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | select(.state == "uploaded") | .name')
+            if ! grep -Fxq "$asset_name" <<<"$existing_assets"; then
+              grep -Fxq "$PREVIOUS_ASSET" <<<"$existing_assets"
+              incomplete_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | select(.state == "starter" and .size == 0) | .name')
+              if grep -Fxq "$asset_name" <<<"$incomplete_assets"; then
+                gh release delete-asset "$RELEASE_TAG" "$asset_name" --yes
+              fi
+              gh release upload "$RELEASE_TAG" "$archive"
+            fi
+          else
+            flags=(--draft)
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" "$archive" --target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file release-notes.md "${flags[@]}"
+          fi
+          gh release download "$RELEASE_TAG" --pattern "$asset_name" --dir "$RUNNER_TEMP/release-verification"
+          python3 - "$archive" "$RUNNER_TEMP/release-verification/$asset_name" <<'PY'
           from pathlib import Path
+          import sys
           import zipfile
-          original, = Path("dist").glob("*.zip")
-          downloaded, = (Path(os.environ["RUNNER_TEMP"]) / "release-verification").glob("*.zip")
+          original, downloaded = map(Path, sys.argv[1:])
           assert original.read_bytes() == downloaded.read_bytes(), "Release asset differs from tested CI package"
           with zipfile.ZipFile(downloaded) as archive:
               assert {name.split("/")[0] for name in archive.namelist()} == {"Open SVPflow.app"}
           PY
+          if [ -n "$PREVIOUS_COMMIT" ]; then
+            if [ "$current_commit" = "$PREVIOUS_COMMIT" ]; then
+              test "$(gh api "$tag_ref" --jq '.object.sha')" = "$PREVIOUS_COMMIT"
+              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" -F force=true --silent
+            fi
+            test "$(gh api "$tag_ref" --jq '.object.sha')" = "$GITHUB_SHA"
+          fi
           if [ "$DRAFT" = false ]; then
             flags=(--draft=false --prerelease="$PRERELEASE")
             if [ "$PRERELEASE" = false ]; then flags+=(--latest); fi
+            if [ -n "$PREVIOUS_COMMIT" ]; then flags+=(--target "$GITHUB_SHA" --title "$RELEASE_TAG" --notes-file release-notes.md); fi
             gh release edit "$RELEASE_TAG" "${flags[@]}"
           fi
-
+          if [ -n "$PREVIOUS_COMMIT" ] && grep -Fxq "$PREVIOUS_ASSET" <<<"$existing_assets"; then
+            gh release delete-asset "$RELEASE_TAG" "$PREVIOUS_ASSET" --yes
+          fi

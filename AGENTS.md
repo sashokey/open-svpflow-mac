@@ -34,7 +34,7 @@ Open SVPflow brings motion-compensated frame interpolation to everyday movie pla
 
 ## Publishing releases
 
-Use the same numbered `vN` for the GitHub tag and release title. Increment `N` for each release, including prereleases. Set the app bundle and ZIP version separately in `.github/release.json`. Publish through `.github/workflows/release.yml` and verify that the tag points to the tested commit and the downloaded ZIP matches the ARM64 CI package.
+Use the same numbered `vN` for the GitHub tag and release title. Increment `N` for each release, including prereleases. Set `version` in `.github/release.json`. Use it in the ZIP filename and the app’s localized version label. Derive the numeric macOS bundle fields from `N`. Publish through `.github/workflows/release.yml` and verify that the tag points to the tested commit and the downloaded ZIP matches the ARM64 CI package. Use `replacement` only with authorization to replace a legacy ZIP and move its published tag. Pin the existing tag commit and old asset name, then remove `replacement` when preparing the next release.
 
 ## Interpolation presets
 

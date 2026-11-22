@@ -74,9 +74,9 @@ class PackageTests(unittest.TestCase):
             icons.mkdir()
             (icons / "OpenSVPflow.icns").write_bytes(b"app-icon")
             (icons / "StatusIconTemplate.png").write_bytes(b"status-icon")
-            app = module.assemble_bundle(source, libraries, executable, icons, Path(directory) / "build", "0.1.3-mac.5")
-            result = module.archive_bundle(app, Path(directory) / "dist", "0.1.3-mac.5")
-            self.assertEqual(result.name, "open-svpflow-0.1.3-mac.5-arm64.zip")
+            app = module.assemble_bundle(source, libraries, executable, icons, Path(directory) / "build", "v11")
+            result = module.archive_bundle(app, Path(directory) / "dist", "v11")
+            self.assertEqual(result.name, "open-svpflow-v11-arm64.zip")
             with zipfile.ZipFile(result) as archive:
                 names = archive.namelist()
                 self.assertEqual({name.split('/')[0] for name in names}, {"Open SVPflow.app"})
@@ -90,11 +90,16 @@ class PackageTests(unittest.TestCase):
                 self.assertTrue(archive.getinfo(prefix + "MacOS/OpenSVPflow").external_attr >> 16 & 0o111)
                 metadata = plistlib.loads(archive.read(prefix + "Info.plist"))
                 self.assertEqual(metadata["CFBundleExecutable"], "OpenSVPflow")
+                self.assertEqual(metadata["CFBundleShortVersionString"], "11.0.0")
+                self.assertEqual(metadata["CFBundleVersion"], "11")
+                self.assertEqual(metadata["OpenSVPflowReleaseVersion"], "v11")
                 self.assertEqual(metadata["LSMinimumSystemVersion"], "26.0")
                 self.assertEqual(set(metadata.get("CFBundleLocalizations", [])), localizations)
                 for locale in localizations:
                     name = "Resources/" + locale + ".lproj/Localizable.strings"
                     self.assertEqual(archive.read(prefix + name), ('"Playback" = "' + locale + '";\n').encode())
+                    info = plistlib.loads(archive.read(prefix + "Resources/" + locale + ".lproj/InfoPlist.strings"))
+                    self.assertEqual(info["CFBundleShortVersionString"], "v11")
 
     def test_invalid_version_fails_before_output_creation(self):
         with tempfile.TemporaryDirectory() as directory:
