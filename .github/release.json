@@ -1,6 +1,6 @@
 {
-  "version": "v13",
+  "version": "v14",
   "draft": false,
   "prerelease": false,
-  "notes": "Fixed a freeze shortly after opening a video when mpv resized the interpolation input to fit the window. The player now measures the video area before starting interpolation and starts the filter at the fitted resolution."
+  "notes": "### Engine\n\n- Fixed high-bit-depth video passthrough when the target frame rate matches the source frame rate.\n- SVSuper and SVAnalyse now report malformed `params` syntax, matching the original filters.\n\n### CI\n\n- Updated the upstream comparison baseline for the imported engine fixes."
 }
