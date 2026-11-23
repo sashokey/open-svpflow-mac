@@ -413,17 +413,24 @@ impl GpuContext {
 
     fn release_job(&self, job: BlendJob, keep: bool) {
         let mut unit = job.unit.into_inner();
-        if !keep {
-            unsafe { self.finish_host_queue(unit.queue) };
+        let pending = job.pending.into_inner();
+        let finished = keep || unsafe { self.finish_host_queue(unit.queue) };
+        if finished {
+            unit.held.clear();
+            drop(pending);
+        } else {
+            let Pending { frames, layers, motion, masks, .. } = pending;
+            self.defer_host_buffers(
+                unit.queue,
+                (unit.take_host_buffers(), frames, layers, motion, masks),
+            );
         }
-        unit.held.clear();
-        drop(job.pending);
         match self.blend_pool.lock() {
             Ok(mut pool) if keep && pool.len() < self.blend_slots.total() => pool.push(job.buffers),
             _ => unsafe { self.release_buffers(&job.buffers) },
         }
         match self.blend_units.lock() {
-            Ok(mut pool) if pool.len() < self.blend_slots.total() => pool.push(unit),
+            Ok(mut pool) if finished && pool.len() < self.blend_slots.total() => pool.push(unit),
             _ => unsafe { self.release_unit(&unit) },
         }
     }
@@ -438,7 +445,7 @@ impl GpuContext {
         fast_occ: bool,
         fast_blend: u8,
     ) -> Option<BlendJob> {
-        if self.depth > 8 || self.cl.CreateImage.is_none() {
+        if self.queue_failed() || self.depth > 8 || self.cl.CreateImage.is_none() {
             return None;
         }
         let rows = height + chroma_height;
@@ -450,6 +457,9 @@ impl GpuContext {
         self.blend_slots
             .cap((BLEND_VRAM_BUDGET / per_job).max(2).min(self.units.len()));
         let slot = self.blend_slots.take()?;
+        if self.queue_failed() {
+            return None;
+        }
         let unit = self.blend_unit()?;
         let reused = self.blend_pool.lock().ok().and_then(|mut pool| {
             let index = pool.iter().position(|buffers| buffers.len == len)?;
@@ -600,7 +610,7 @@ impl GpuContext {
         waits.retain(|event| !event.is_null());
         waits.dedup();
         let queue = unit.queue;
-        unsafe {
+        let submitted = (|| unsafe {
             let set = self.cl.SetKernelArg;
             for plane in 0..3 {
                 let params = first.params[plane];
@@ -670,13 +680,15 @@ impl GpuContext {
                 }
             }
             (self.cl.Flush)(queue);
-        }
-        job.dirty.set(true);
+            Some(())
+        })();
         for slot in slots {
             if let Some(group) = slot.group {
                 pending.frames.extend(group.frames);
             }
         }
+        submitted?;
+        job.dirty.set(true);
         job.failed.set(false);
         Some(())
     }

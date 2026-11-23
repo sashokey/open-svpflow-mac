@@ -25,6 +25,7 @@ struct OpenCl {
     EnqueueReadImage: FnEnqueueWriteImage,
     ReleaseKernel: FnRelease,
     ReleaseProgram: FnRelease,
+    RetainCommandQueue: FnRelease,
     ReleaseCommandQueue: FnRelease,
 }
 
@@ -48,6 +49,7 @@ impl OpenCl {
             EnqueueReadImage: unsafe { core.symbol("clEnqueueReadImage\0")? },
             ReleaseKernel: unsafe { core.symbol("clReleaseKernel\0")? },
             ReleaseProgram: unsafe { core.symbol("clReleaseProgram\0")? },
+            RetainCommandQueue: unsafe { core.symbol("clRetainCommandQueue\0")? },
             ReleaseCommandQueue: unsafe { core.symbol("clReleaseCommandQueue\0")? },
             core,
         })
@@ -126,9 +128,15 @@ pub struct GpuContext {
     blend_units: std::sync::Mutex<Vec<Unit>>,
     pins: std::sync::Mutex<Vec<Pin>>,
     dst_pool: std::sync::Mutex<Vec<[(ClMem, usize); 3]>>,
+    deferred_buffers: std::sync::Mutex<Vec<DeferredBuffers>>,
     pressure: Pressure,
     vram: vram::Vram,
     reserve: usize,
+}
+
+struct DeferredBuffers {
+    queue: ClCommandQueue,
+    data: Box<dyn std::any::Any + Send>,
 }
 
 struct Pin {
@@ -280,6 +288,13 @@ impl ImageSlot {
 
 unsafe impl Send for Unit {}
 
+type HostBuffers = (
+    Vec<Box<dyn std::any::Any + Send>>,
+    Vec<u16>,
+    Vec<u16>,
+    Vec<u8>,
+);
+
 impl Unit {
     fn new(kernel: ClKernel, queue: ClCommandQueue, xfer: ClCommandQueue) -> Self {
         Self {
@@ -297,6 +312,15 @@ impl Unit {
             blend: blend::UnitState::default(),
             cover: cover::UnitCover::default(),
         }
+    }
+
+    fn take_host_buffers(&mut self) -> HostBuffers {
+        (
+            std::mem::take(&mut self.held),
+            std::mem::take(&mut self.packed_base),
+            std::mem::take(&mut self.packed_ext),
+            std::mem::take(&mut self.packed_mask),
+        )
     }
 }
 
@@ -331,6 +355,7 @@ unsafe impl Send for StillState {}
 pub struct Mark {
     epoch: usize,
     events: usize,
+    queue_failed: bool,
 }
 
 struct Pressure {
@@ -338,6 +363,7 @@ struct Pressure {
     events: std::sync::atomic::AtomicUsize,
     strained: std::sync::atomic::AtomicBool,
     cpu: std::sync::atomic::AtomicBool,
+    queue_failed: std::sync::atomic::AtomicBool,
     fallback: std::sync::Mutex<Fallback>,
 }
 
@@ -363,6 +389,16 @@ unsafe impl Sync for GpuContext {}
 impl Drop for GpuContext {
     fn drop(&mut self) {
         unsafe {
+            let deferred = self
+                .deferred_buffers
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for DeferredBuffers { queue, data } in deferred.drain(..) {
+                if (self.cl.Finish)(queue) != CL_SUCCESS {
+                    std::mem::forget(data);
+                }
+                (self.cl.ReleaseCommandQueue)(queue);
+            }
             if let Ok(mut cache) = self.super_cache.lock() {
                 cache.clear();
             }
@@ -699,11 +735,13 @@ impl GpuContext {
                 blend_units: std::sync::Mutex::new(Vec::new()),
                 pins: std::sync::Mutex::new(Vec::new()),
                 dst_pool: std::sync::Mutex::new(Vec::new()),
+                deferred_buffers: std::sync::Mutex::new(Vec::new()),
                 pressure: Pressure {
                     epoch: std::sync::atomic::AtomicUsize::new(0),
                     events: std::sync::atomic::AtomicUsize::new(0),
                     strained: std::sync::atomic::AtomicBool::new(false),
                     cpu: std::sync::atomic::AtomicBool::new(false),
+                    queue_failed: std::sync::atomic::AtomicBool::new(false),
                     fallback: std::sync::Mutex::new(Fallback {
                         since: std::time::Instant::now(),
                         wait: std::time::Duration::ZERO,
@@ -805,6 +843,9 @@ impl GpuContext {
     }
 
     pub fn cache_frame(&self, key: i64, planes: [UploadPlane<'_>; 3]) -> Option<SuperHandle> {
+        if self.queue_failed() {
+            return None;
+        }
         let cell = {
             let mut cache = self.super_cache.lock().ok()?;
             if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
@@ -871,6 +912,9 @@ impl GpuContext {
     }
 
     fn upload_frame(&self, planes: [UploadPlane<'_>; 3]) -> Option<SuperEntry> {
+        if self.queue_failed() {
+            return None;
+        }
         let width = planes[0].width;
         let height = planes[0].height;
         let dims = (
@@ -882,6 +926,9 @@ impl GpuContext {
         self.frame_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
         let reused = self.image_pool.lock().ok().and_then(|mut pool| {
+            if self.queue_failed() {
+                return None;
+            }
             let index = pool
                 .iter()
                 .position(|images| (images.dims, images.luma) == (dims, (width, height)))?;
@@ -1181,15 +1228,22 @@ impl GpuContext {
                 .pressure
                 .events
                 .load(std::sync::atomic::Ordering::Acquire),
+            queue_failed: self.queue_failed(),
         }
     }
 
     pub fn cpu_render(&self) -> bool {
-        self.pressure.cpu.load(std::sync::atomic::Ordering::Acquire)
+        self.queue_failed() || self.pressure.cpu.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn queue_failed(&self) -> bool {
+        self.pressure
+            .queue_failed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub fn retry(&self) {
-        if !self.cpu_render() {
+        if self.queue_failed() || !self.cpu_render() {
             return;
         }
         let Ok(fallback) = self.pressure.fallback.try_lock() else {
@@ -1203,7 +1257,7 @@ impl GpuContext {
             (Some(then), Some(now)) => now >= then.saturating_add(self.reserve),
             _ => true,
         };
-        if (freed || waited >= RETRY_MOST) && self.cpu_render() {
+        if (freed || waited >= RETRY_MOST) && self.cpu_render() && !self.queue_failed() {
             self.blend_slots.restore(self.units.len());
             self.pressure
                 .strained
@@ -1255,6 +1309,9 @@ impl GpuContext {
     }
 
     pub fn recover(&self, mark: Mark) -> bool {
+        if self.queue_failed() {
+            return !mark.queue_failed;
+        }
         if !self.exhausted_since(mark) {
             return false;
         }
@@ -1496,10 +1553,37 @@ impl GpuContext {
         }
     }
 
-    unsafe fn finish_host_queue(&self, queue: ClCommandQueue) {
-        if unsafe { self.note((self.cl.Finish)(queue)) } != CL_SUCCESS {
-            eprintln!("open-svpflow: failed to synchronize an OpenCL host transfer");
-            std::process::abort();
+    unsafe fn finish_host_queue(&self, queue: ClCommandQueue) -> bool {
+        if unsafe { (self.cl.Finish)(queue) } == CL_SUCCESS {
+            return true;
+        }
+        let first = !self
+            .pressure
+            .queue_failed
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        if first {
+            eprintln!("open-svpflow: failed to drain an OpenCL queue, switching to the CPU render");
+        }
+        false
+    }
+
+    fn defer_host_buffers(&self, queue: ClCommandQueue, data: impl Send + 'static) {
+        if unsafe { (self.cl.RetainCommandQueue)(queue) } != CL_SUCCESS {
+            std::mem::forget(data);
+            return;
+        }
+        self.deferred_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(DeferredBuffers {
+                queue,
+                data: Box::new(data),
+            });
+    }
+
+    fn finish_render_queue(&self, unit: &mut Unit) {
+        if !unsafe { self.finish_host_queue(unit.queue) } {
+            self.defer_host_buffers(unit.queue, unit.take_host_buffers());
         }
     }
 
@@ -2057,6 +2141,9 @@ impl GpuContext {
         let layer = layer.filter(|l| !l.is_empty());
         let _readback = self.readbacks.take()?;
         let mut unit = self.acquire();
+        if self.queue_failed() {
+            return None;
+        }
         let use_quad = fast.1 && self.depth == 8 && still.is_none() && layer.is_none();
         let fast_bits = if fast.0 >= 1 { 1 << 19 } else { 0 }
             | if use_quad { 1 << 20 } else { 0 };
@@ -2093,7 +2180,7 @@ impl GpuContext {
                 area,
                 cover,
             ) else {
-                self.finish_host_queue(q);
+                self.finish_render_queue(&mut unit);
                 return None;
             };
             let mut images = [std::ptr::null_mut(); 8];
@@ -2115,7 +2202,7 @@ impl GpuContext {
             }
             let images = &images[..image_count];
             if self.bind_render_images(k, images).is_none() {
-                self.finish_host_queue(q);
+                self.finish_render_queue(&mut unit);
                 return None;
             }
             let xq = unit.xfer;
@@ -2123,7 +2210,7 @@ impl GpuContext {
             let mut dst = match self.dst_pool.lock() {
                 Ok(mut pool) => pool.pop().unwrap_or([(std::ptr::null_mut(), 0); 3]),
                 Err(_) => {
-                    self.finish_host_queue(q);
+                    self.finish_render_queue(&mut unit);
                     return None;
                 }
             };
@@ -2133,7 +2220,7 @@ impl GpuContext {
                 self.ensure_buffer(&mut dst[2], dst_v.len()),
             ];
             let [Some(y_mem), Some(u_mem), Some(v_mem)] = mems else {
-                self.finish_host_queue(q);
+                self.finish_render_queue(&mut unit);
                 self.put_dst(dst);
                 return None;
             };
@@ -2244,12 +2331,12 @@ impl GpuContext {
                     }
                 });
             if queued.is_none() {
-                self.finish_host_queue(q);
+                self.finish_render_queue(&mut unit);
                 self.put_dst(dst);
                 return None;
             }
             if self.note((self.cl.Flush)(q)) != CL_SUCCESS {
-                self.finish_host_queue(q);
+                self.finish_render_queue(&mut unit);
                 (self.cl.ReleaseEvent)(kernel_done);
                 self.put_dst(dst);
                 return None;
@@ -2289,7 +2376,7 @@ impl GpuContext {
                 )) != CL_SUCCESS
                 {
                     drop(reads);
-                    self.finish_host_queue(q);
+                    self.finish_render_queue(&mut unit);
                     (self.cl.ReleaseEvent)(kernel_done);
                     self.put_dst(dst);
                     if let Some(pin) = pin {
@@ -2298,19 +2385,15 @@ impl GpuContext {
                     return None;
                 }
             }
-            let held = (
-                std::mem::take(&mut unit.held),
-                std::mem::take(&mut unit.packed_base),
-                std::mem::take(&mut unit.packed_ext),
-                std::mem::take(&mut unit.packed_mask),
-            );
+            let held = unit.take_host_buffers();
             drop(unit);
             let finished = reads.wait();
-            if !finished {
-                self.finish_host_queue(q);
+            if !finished && !self.finish_host_queue(q) {
+                self.defer_host_buffers(q, held);
+            } else {
+                drop(held);
             }
             (self.cl.ReleaseEvent)(kernel_done);
-            drop(held);
             self.put_dst(dst);
             if let Some(pin) = pin {
                 if finished {
@@ -2328,8 +2411,14 @@ impl GpuContext {
     }
 
     fn put_dst(&self, dst: [(ClMem, usize); 3]) {
-        if let Ok(mut pool) = self.dst_pool.lock() {
+        if !self.queue_failed() && let Ok(mut pool) = self.dst_pool.lock() {
             pool.push(dst);
+            return;
+        }
+        for (mem, _) in dst {
+            if !mem.is_null() {
+                unsafe { (self.cl.ReleaseMemObject)(mem) };
+            }
         }
     }
 }
@@ -4862,6 +4951,69 @@ fn chroma_pair_supported(
 #[cfg(test)]
 mod tests {
     use super::{GpuContext, KernelParams, chroma_pair_supported};
+
+    #[test]
+    fn failed_owned_queue_drain_stays_on_cpu() {
+        let Some(mut gpu) = GpuContext::new(0, 1, 8, false) else {
+            assert!(std::env::var_os("OPEN_SVPFLOW_REQUIRE_TEST_GPU").is_none());
+            return;
+        };
+
+        unsafe extern "C" fn out_of_resources(_: super::ClCommandQueue) -> super::ClInt {
+            super::CL_OUT_OF_RESOURCES
+        }
+
+        let queue = gpu.units[0].lock().unwrap().queue;
+        let mark = gpu.mark();
+        let finish = std::mem::replace(&mut gpu.cl.core.Finish, out_of_resources);
+        unsafe { gpu.finish_host_queue(queue) };
+        gpu.cl.core.Finish = finish;
+
+        assert!(gpu.cpu_render());
+        assert!(!gpu.exhausted_since(mark));
+        assert!(gpu.recover(mark));
+        assert!(!gpu.recover(gpu.mark()));
+        gpu.retry();
+        assert!(gpu.cpu_render());
+    }
+
+    #[test]
+    fn failed_render_queue_keeps_host_buffers_until_it_drains() {
+        let Some(mut gpu) = GpuContext::new(0, 1, 8, false) else {
+            assert!(std::env::var_os("OPEN_SVPFLOW_REQUIRE_TEST_GPU").is_none());
+            return;
+        };
+
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct PendingBuffer(Arc<AtomicBool>);
+
+        impl Drop for PendingBuffer {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        unsafe extern "C" fn out_of_host_memory(_: super::ClCommandQueue) -> super::ClInt {
+            super::CL_OUT_OF_HOST_MEMORY
+        }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let finish = std::mem::replace(&mut gpu.cl.core.Finish, out_of_host_memory);
+        {
+            let mut unit = gpu.units[0].lock().unwrap();
+            unit.held.push(Box::new(PendingBuffer(Arc::clone(&released))));
+            gpu.finish_render_queue(&mut unit);
+        }
+        assert!(!released.load(Ordering::Acquire));
+        assert!(gpu.cpu_render());
+        gpu.cl.core.Finish = finish;
+        drop(gpu);
+        assert!(released.load(Ordering::Acquire));
+    }
 
     #[test]
     fn render_images_skip_the_params_argument() {
