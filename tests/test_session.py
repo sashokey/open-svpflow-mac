@@ -205,6 +205,30 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("interpolation", owner.error.lower())
         self.assertTrue(owner.ready.is_set())
 
+    def test_viewport_probe_waits_for_the_first_interpolated_frame(self):
+        class Client:
+            def get(self, name, default=None):
+                return {
+                    "vf": [{"label": "svp-interpolate", "name": "vapoursynth", "enabled": True}],
+                    "video-out-params": {"w": 2560, "h": 1440},
+                }.get(name, default)
+
+            def command(self, command, **kwargs):
+                return None
+
+        owner = session.PlaybackSession(self.root / "state", self.root, self.root / "runtime", notify=lambda root: None)
+        owner.client = Client()
+        owner.process_event({"event": "client-message", "args": ["open-svpflow-probing-viewport"]})
+        session.atomic_json(owner.runtime_dir / "graph-0.json", {"target_fps": 72})
+        owner.process_event({"event": "playback-restart"})
+        self.assertIsNone(owner.error)
+        self.assertFalse(owner.active)
+        self.assertFalse(owner.ready.is_set())
+
+        owner.process_event({"event": "playback-restart"})
+        self.assertTrue(owner.active)
+        self.assertTrue(owner.ready.is_set())
+
     def test_active_filter_label_and_video_are_insufficient_without_graph_confirmation(self):
         commands = []
         class Client:

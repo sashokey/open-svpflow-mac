@@ -367,6 +367,7 @@ class PlaybackSession:
         self.error = None
         self.failure = None
         self.graph_attempt = 0
+        self.probing_viewport = False
         self.loading_entry = 0
         self.confirmed_entry = 0
         self.file_title = ""
@@ -448,6 +449,7 @@ class PlaybackSession:
         self.ready.clear()
         self.active = False
         self.graph_attempt += 1
+        self.probing_viewport = False
         self.after_start = document["preferences"]["after_start"]
         rate = rate_argument(document)
         self.quality = PlaybackQuality(file, rate)
@@ -482,6 +484,10 @@ class PlaybackSession:
             arguments = event.get("args", [])
             if arguments and arguments[0] == "open-svpflow-bridge-ready":
                 self.bridge_ready.set()
+            elif arguments == ["open-svpflow-probing-viewport"]:
+                self.probing_viewport = True
+            elif arguments == ["open-svpflow-viewport-failed"]:
+                self.fail_playback("The interpolation filter could not start.")
             elif arguments and arguments[0] == "open-svpflow-before-load":
                 try:
                     self.configure_file()
@@ -497,6 +503,9 @@ class PlaybackSession:
         elif name == "start-file":
             self.loading_entry = event["playlist_entry_id"]
         elif name == "playback-restart":
+            if self.probing_viewport:
+                self.probing_viewport = False
+                return
             report = self.graph_report()
             target = finite_number(report.get("target_fps"))
             if not self._filter_ok():

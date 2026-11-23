@@ -1,6 +1,6 @@
 {
-  "version": "v12",
+  "version": "v13",
   "draft": false,
   "prerelease": false,
-  "notes": "Fixed an OpenCL queue cleanup error that could terminate the player. The affected playback context retries on CPU, and pending host buffers are kept until the driver confirms completion. Added regression tests for CPU recovery and buffer lifetime."
+  "notes": "Fixed a freeze shortly after opening a video when mpv resized the interpolation input to fit the window. The player now measures the video area before starting interpolation and starts the filter at the fitted resolution."
 }

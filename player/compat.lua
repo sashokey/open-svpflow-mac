@@ -3,6 +3,10 @@ local normal_graph
 local render_width, render_height
 local viewport_key
 local playback_ready = false
+local startup
+local interpolation_suspended = false
+local session_client
+local fail_cli
 
 if mp.get_property("options/autofit-larger", "") == "" then
     mp.set_property("options/autofit-larger", "100%x100%")
@@ -30,21 +34,42 @@ local function fitted_axis(axis, other, limit, other_limit, alignment)
         :format(axis, alignment, limit, other_limit, axis, other, alignment, alignment)
 end
 
-local function configure(reset)
+local function finish_startup()
+    if not startup then return end
+    local paused = startup.paused
+    startup = nil
+    if not paused then mp.set_property_native("pause", false) end
+end
+
+local function fail_startup()
+    finish_startup()
+    if session_client then
+        mp.commandv("script-message-to", session_client, "open-svpflow-viewport-failed")
+    else
+        fail_cli("The interpolation filter could not start.")
+    end
+end
+
+local function configure(reset, activate)
     local filters = mp.get_property_native("vf", {})
-    local input
+    local input, interpolation
     local preceding, following = false, false
     for _, filter in ipairs(filters) do
         if filter.label == "svp-input" then
             input = filter
-        elseif filter.label ~= "svp-interpolate" and filter.enabled ~= false then
+        elseif filter.label == "svp-interpolate" then
+            interpolation = filter
+        elseif filter.enabled ~= false then
             if input then following = true else preceding = true end
         end
     end
-    if not input or input.enabled == false or not input.params or not input.params.graph then return end
+    if not input or input.enabled == false or not input.params or not input.params.graph or activate and not interpolation then
+        if activate then fail_startup() end
+        return
+    end
     normal_graph = normal_graph or input.params.graph
     local params = not reset and mp.get_property_native("video-dec-params")
-    if not reset and not params then return end
+    if not reset and not activate and not params then return end
     if not params then
         local video = mp.get_property_number("vid")
         for _, track in ipairs(mp.get_property_native("track-list", {})) do
@@ -79,29 +104,56 @@ local function configure(reset)
             graph = graph:gsub("^scale=w=iw:h=ih", scale)
         end
     end
-    if input.params.graph ~= graph then
+    local restore = reset and interpolation_suspended and interpolation and interpolation.enabled == false
+    local probe = reset and interpolation and (interpolation.enabled ~= false or restore)
+        and valid_size(width, height) and not following
+        and mp.get_property_bool("seekable", false) and not mp.get_property_bool("partially-seekable", false)
+        and mp.get_property_number("options/frames", -1) < 0
+        and mp.get_property("options/video-unscaled", "no") ~= "yes"
+        and mp.get_property("options/video-crop", "") == ""
+    if probe and mp.get_property("options/vo") == "null" then
+        local osd = mp.get_property_native("osd-dimensions", {})
+        probe = valid_size(osd.w, osd.h)
+    end
+    if probe then
+        startup = {paused = mp.get_property_bool("pause", false), waiting_for_viewport = true}
+        mp.set_property_native("pause", true)
+        interpolation.enabled = false
+    elseif activate or restore then
+        interpolation.enabled = true
+        if activate then startup.waiting_for_viewport = false end
+    end
+    if input.params.graph ~= graph or probe or activate or restore then
         if render_width then
             mp.set_property_native("file-local-options/auto-window-resize", false)
         end
         input.params.graph = graph
-        mp.set_property_native("vf", filters)
+        if not mp.set_property_native("vf", filters) then
+            if probe or activate or restore then fail_startup() end
+            return
+        end
+        if probe or activate or restore then interpolation_suspended = probe end
+        if probe and session_client then
+            mp.commandv("script-message-to", session_client, "open-svpflow-probing-viewport")
+        end
     end
 end
 
 local resize_timer = mp.add_timeout(0.25, function()
+    local activate = startup and startup.waiting_for_viewport
     local osd = mp.get_property_native("osd-dimensions", {})
     local unscaled = mp.get_property("options/video-unscaled", "no")
     local crop = mp.get_property("options/video-crop", "")
     local key
     if valid_size(osd.w, osd.h) then
         key = table.concat({osd.w, osd.h, unscaled, crop, mp.get_property("fullscreen", "no")}, ":")
-        if key == viewport_key then return end
+        if key == viewport_key and not activate then return end
     end
     local width, height = rendered_size(osd, unscaled)
-    if not width and unscaled ~= "yes" then return end
+    if not width and unscaled ~= "yes" and not activate then return end
     viewport_key = key
     render_width, render_height = width, height
-    configure(false)
+    configure(false, activate)
 end, true)
 
 local function schedule_resize()
@@ -111,6 +163,7 @@ local function schedule_resize()
 end
 
 local function reset_size()
+    finish_startup()
     playback_ready = false
     resize_timer:kill()
     render_width, render_height = nil, nil
@@ -124,6 +177,10 @@ end)
 mp.register_event("video-reconfig", function() configure(false) end)
 mp.register_event("playback-restart", function()
     playback_ready = true
+    if startup and not startup.waiting_for_viewport then
+        finish_startup()
+        return
+    end
     schedule_resize()
 end)
 mp.register_event("end-file", reset_size)
@@ -134,7 +191,6 @@ mp.observe_property("fullscreen", "bool", schedule_resize)
 mp.observe_property("options/video-unscaled", "string", schedule_resize)
 mp.observe_property("options/video-crop", "string", schedule_resize)
 
-local session_client
 local pending_load
 local json = require "mp.utils"
 local report_directory = os.getenv("OPEN_SVPFLOW_GRAPH_DIR")
@@ -150,7 +206,7 @@ local function read_cli_report()
     return report or {}
 end
 
-local function fail_cli(message)
+fail_cli = function(message)
     if cli_failed then return end
     cli_failed = true
     io.stderr:write("Open SVPflow: " .. (read_cli_report().message or message) .. "\n")
@@ -174,7 +230,7 @@ if report_directory then
         end
     end)
     mp.register_event("playback-restart", function()
-        if session_client then return end
+        if session_client or startup then return end
         if cli_filter_active(mp.get_property_native("vf"))
             and read_cli_report().target_fps and mp.get_property_native("video-out-params") then
             cli_started = true

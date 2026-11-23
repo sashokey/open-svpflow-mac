@@ -5,15 +5,14 @@ local function verify()
     local timer
     local input = {label = "svp-input", params = {graph = "scale=w=iw:h=ih,format=pix_fmts=yuv420p|yuv444p"}}
     local source_graph = input.params.graph
-    local output = {label = "svp-interpolate"}
+    local output = {label = "svp-interpolate", name = "vapoursynth"}
     local user_filter = {label = "user-filter", enabled = false}
     local filters = {input, output, user_filter}
     local properties = {
         vf = filters,
         ["track-list"] = {{type = "video", id = 1, ["demux-w"] = 3840, ["demux-h"] = 2160}},
         ["video-dec-params"] = {w = 3840, h = 2160},
-        ["video-target-params"] = {w = 2528, h = 1422},
-        ["osd-dimensions"] = {w = 2528, h = 1600},
+        seekable = true,
     }
     local updates = 0
     local function get(name, default)
@@ -23,6 +22,7 @@ local function verify()
     end
     package.loaded.mp = {
         get_property = get,
+        get_property_bool = get,
         get_property_native = get,
         get_property_number = get,
         set_property = function(name, value) properties[name] = value end,
@@ -57,25 +57,40 @@ local function verify()
     assert(observers["video-target-params/w"], "Rendered video width is not tracked")
     assert(observers["video-target-params/h"], "Rendered video height is not tracked")
     hooks.on_preloaded()
+    assert(output.enabled == false, "Interpolation started before the viewport was known")
+    assert(properties.pause == true, "Playback advanced while probing the viewport")
+    properties["video-target-params"] = {w = 3840, h = 2160}
+    properties["osd-dimensions"] = {w = 3840, h = 2160}
     events["playback-restart"]()
+    assert(output.enabled == false, "Probe frame enabled interpolation before viewport sampling")
+    properties["video-target-params"] = {w = 2528, h = 1422}
+    properties["osd-dimensions"] = {w = 2528, h = 1600}
+    observers["osd-dimensions"]()
     timer:fire()
+    assert(output.enabled == true, "Interpolation was not enabled after the viewport was measured")
     assert(input.params.graph:find("min(2528,1422*iw/ih)", 1, true))
     assert(input.params.graph:find("min(1422,2528*ih/iw)", 1, true))
+    assert(properties.pause == true, "Playback resumed before a filtered frame")
+    local startup_updates = updates
+    events["playback-restart"]()
+    assert(properties.pause == false, "Playback did not resume after the first filtered frame")
+    events["video-reconfig"]()
+    assert(updates == startup_updates, "First filtered frame caused another filter update")
     properties["video-target-params"] = {w = 1700, h = 956}
     properties["osd-dimensions"] = {w = 1700, h = 1024}
     observers["video-target-params/w"]()
     properties["video-target-params"] = {w = 1280, h = 720}
     properties["osd-dimensions"] = {w = 1280, h = 800}
     observers["video-target-params/h"]()
-    assert(updates == 1, "Filter rebuilt during an interactive resize")
+    assert(updates == startup_updates, "Filter rebuilt during an interactive resize")
     timer:fire()
-    assert(updates == 2 and input.params.graph:find("min(1280,720*iw/ih)", 1, true))
+    assert(updates == startup_updates + 1 and input.params.graph:find("min(1280,720*iw/ih)", 1, true))
     events["video-reconfig"]()
-    assert(updates == 2, "Filter rebuilt again during output reconfiguration")
+    assert(updates == startup_updates + 1, "Filter rebuilt again during output reconfiguration")
     properties["video-target-params"] = {w = 1280, h = 719}
     observers["video-target-params/h"]()
     timer:fire()
-    assert(updates == 2, "A rounding change fed back into an unchanged viewport")
+    assert(updates == startup_updates + 1, "A rounding change fed back into an unchanged viewport")
     properties["osd-dimensions"] = {w = 2048, h = 1400, ml = 64, mr = 64, mt = 160, mb = 160}
     observers["osd-dimensions"]()
     timer:fire()
@@ -104,6 +119,35 @@ local function verify()
     assert(updates == unchanged, "A reconfiguration without video changed the filters")
     events["end-file"]()
     assert(not timer.active, "Resize survived end of file")
+
+    properties.seekable = false
+    hooks.on_preloaded()
+    assert(output.enabled == true and properties.pause == false, "A non-seekable source entered the viewport probe")
+    events["end-file"]()
+    properties.seekable = true
+    properties["partially-seekable"] = true
+    hooks.on_preloaded()
+    assert(output.enabled == true and properties.pause == false, "A partially seekable stream entered the viewport probe")
+    events["end-file"]()
+
+    properties["partially-seekable"] = false
+    properties["options/frames"] = 1
+    hooks.on_preloaded()
+    assert(output.enabled == true and properties.pause == false, "A viewport probe used a frame from a limited run")
+    events["end-file"]()
+    properties["options/frames"] = -1
+    hooks.on_preloaded()
+    events["playback-restart"]()
+    events["end-file"]()
+    assert(properties.pause == false and not timer.active, "An interrupted probe kept the player paused")
+    properties.seekable = false
+    hooks.on_preloaded()
+    assert(output.enabled == true, "An interrupted probe disabled interpolation for the next file")
+    events["end-file"]()
+    output.enabled = false
+    properties.seekable = true
+    hooks.on_preloaded()
+    assert(output.enabled == false and properties.pause == false, "Startup enabled an intentionally disabled filter")
 end
 
 local ok, error_message = pcall(verify)
