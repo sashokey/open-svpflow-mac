@@ -28,9 +28,19 @@ def build_executable(source, scratch):
     return Path(result.stdout.strip()) / "OpenSVPflow"
 
 
+def build_worker(source, output):
+    output = Path(output)
+    subprocess.run([
+        "/usr/bin/xcrun", "clang", "-arch", "arm64", "-mmacosx-version-min=26.0", "-Os",
+        "-Wall", "-Wextra", "-Werror", str(Path(source) / "macos/PlaybackWorker.c"), "-o", str(output),
+    ], check=True, timeout=30)
+    return output
+
+
 def sign_bundle(app):
     contents = Path(app) / "Contents"
-    for relative in ("Frameworks/libsvpflow1_vs.dylib", "Frameworks/libsvpflow2_vs.dylib", "MacOS/OpenSVPflow", "."):
+    for relative in ("Frameworks/libsvpflow1_vs.dylib", "Frameworks/libsvpflow2_vs.dylib", "MacOS/OpenSVPflow",
+                     "Helpers/Open SVPflow Playback.app", "."):
         path = Path(app) if relative == "." else contents / relative
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(path)], check=True, timeout=30)
     subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True, timeout=30)

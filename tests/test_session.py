@@ -120,6 +120,28 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.read_json(state / "session.json"), record)
         process.assert_not_called()
 
+    def test_packaged_playback_starts_the_controller_through_launch_services(self):
+        contents = self.root / "Open SVPflow.app" / "Contents"
+        resources = contents / "Resources"
+        resources.mkdir(parents=True)
+        host = contents / "Helpers" / "Open SVPflow Playback.app"
+        host.mkdir(parents=True)
+        record = {"pid": 12345}
+        response = {"ok": True, "status": "started"}
+        with (
+            patch.object(session.sys, "platform", "darwin"),
+            patch.object(session, "connect_existing", side_effect=[None, record]),
+            patch.object(session, "rpc", return_value=response),
+            patch.object(session.subprocess, "Popen") as process,
+        ):
+            self.assertEqual(session.open_files(self.root / "state", resources, self.files[:1]), response)
+        command = process.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/open")
+        self.assertEqual(command[command.index("-a") + 1], str(host))
+        arguments = command[command.index("--args") + 1:]
+        self.assertEqual(arguments[0:2], [sys.executable, "-B"])
+        self.assertEqual(arguments[3:], ["serve", "--state-dir", str(self.root / "state"), "--bundle-root", str(resources)])
+
 if __name__ == "__main__":
     unittest.main()
 

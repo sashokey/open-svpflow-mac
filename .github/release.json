@@ -1,6 +1,6 @@
 {
-  "version": "v14",
+  "version": "v15",
   "draft": false,
   "prerelease": false,
-  "notes": "### Engine\n\n- Fixed high-bit-depth video passthrough when the target frame rate matches the source frame rate.\n- SVSuper and SVAnalyse now report malformed `params` syntax, matching the original filters.\n\n### CI\n\n- Updated the upstream comparison baseline for the imported engine fixes."
+  "notes": "### Playback\n\n- Keep mpv and its playback controller running when the launcher exits under Quit App. Reopening the launcher reconnects to the current movie.\n- Fix the startup freeze associated with losing the VideoToolbox decoder after the launcher exits. Closing mpv ends the playback session.\n\n### Verification\n\n- Added a cold Quit App regression check for playback progress, controller identity, and the current movie title after reopening."
 }

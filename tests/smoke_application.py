@@ -296,6 +296,36 @@ def gui_mode(app, probe, mode):
     return value if matches_gui_mode(value, mode) else False
 
 
+def cold_quit_app(app, resources, state, movie, environment):
+    record = client = None
+    command = ["/usr/bin/open", "--env", "MPV_HOME=" + environment["MPV_HOME"], "-a", str(app)]
+    try:
+        subprocess.run([*command, "-n", "-W", str(movie)], check=True, timeout=60)
+        assert not gui_pids(app), "The cold launcher did not exit under Quit App"
+        record, client = wait_for_started_session(resources, state, environment)
+        worker_pid, player_pid = record["pid"], client.get("pid")
+        start = client.get("playback-time")
+        assert isinstance(start, (int, float))
+
+        def advancing():
+            position = client.get("playback-time")
+            return isinstance(position, (int, float)) and position >= start + 15
+
+        wait_for(advancing, "Playback did not continue while the launcher was closed", timeout=28)
+        subprocess.run(command, check=True, timeout=5)
+        wait_for(lambda: gui_pids(app), "The launcher did not reopen")
+        resumed = backend(resources, state, "status", environment=environment)
+        assert resumed["status"] == "started" and resumed["playback"]["title"] == movie.name, resumed
+        assert json.loads((state / "session.json").read_text())["pid"] == worker_pid
+        assert client.get("pid") == player_pid
+        print("PASS: cold Quit App kept playback advancing and the reopened launcher found the same movie", flush=True)
+    finally:
+        for identifier in gui_pids(app):
+            os.kill(identifier, signal.SIGTERM)
+        wait_for(lambda: not gui_pids(app), "The owned cold-launch GUI did not close", timeout=5)
+        stop_session(state, record, client)
+
+
 def gui_lifetime(app, resources, directory, files, configuration, environment):
     require_isolated_gui(os.environ)
     files = make_gui_fixtures(files)
@@ -306,6 +336,9 @@ def gui_lifetime(app, resources, directory, files, configuration, environment):
     document = backend(resources, state, "settings-get", environment=environment)["document"]
     document["interpolation"]["backend"] = "cpu"
     document["playback"].update(rate="fixed", fps="48")
+    document["preferences"]["after_start"] = "quit_app"
+    backend(resources, state, "settings-save", {"document": document}, environment)
+    cold_quit_app(app, resources, state, files[0], environment)
     document["preferences"]["after_start"] = "keep_open"
     backend(resources, state, "settings-save", {"document": document}, environment)
     probe = directory / "gui-runtime-probe"

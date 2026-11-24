@@ -18,6 +18,29 @@ spec.loader.exec_module(module)
 
 
 class PackageTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "macOS playback controller")
+    def test_playback_worker_logs_an_interpreter_start_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            area = Path(directory)
+            contents = area / "Open SVPflow.app/Contents"
+            executable = contents / "Helpers/Open SVPflow Playback.app/Contents/MacOS/PlaybackWorker"
+            executable.parent.mkdir(parents=True)
+            resources = contents / "Resources"
+            script = resources / "player/application.py"
+            script.parent.mkdir(parents=True)
+            script.touch()
+            state = area / "state"
+            state.mkdir(mode=0o700)
+            log = state / "session.log"
+            log.touch(mode=0o600)
+            subprocess.run(["/usr/bin/xcrun", "clang", str(root / "macos/PlaybackWorker.c"), "-o", str(executable)],
+                           check=True, capture_output=True, timeout=15)
+            failed = subprocess.run([
+                executable, area / "python3", "-B", script, "serve", "--state-dir", state, "--bundle-root", resources,
+            ], capture_output=True, timeout=5)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("Unable to launch the Open SVPflow controller", log.read_text())
+
     @unittest.skipUnless(Path("/usr/bin/plutil").is_file(), "macOS strings parser")
     def test_bundled_translations_match_settings_and_keep_format_arguments(self):
         sys.path.insert(0, str(root / "player"))
@@ -70,11 +93,14 @@ class PackageTests(unittest.TestCase):
             executable = Path(directory) / "OpenSVPflow"
             executable.write_bytes(b"native-launcher")
             executable.chmod(0o755)
+            worker = Path(directory) / "PlaybackWorker"
+            worker.write_bytes(b"native-playback-host")
+            worker.chmod(0o755)
             icons = Path(directory) / "icons"
             icons.mkdir()
             (icons / "OpenSVPflow.icns").write_bytes(b"app-icon")
             (icons / "StatusIconTemplate.png").write_bytes(b"status-icon")
-            app = module.assemble_bundle(source, libraries, executable, icons, Path(directory) / "build", "v11")
+            app = module.assemble_bundle(source, libraries, executable, icons, Path(directory) / "build", "v11", worker=worker)
             result = module.archive_bundle(app, Path(directory) / "dist", "v11")
             self.assertEqual(result.name, "open-svpflow-v11-arm64.zip")
             with zipfile.ZipFile(result) as archive:
@@ -88,6 +114,14 @@ class PackageTests(unittest.TestCase):
                 self.assertFalse(any("docs/" in name or "__pycache__" in name for name in names))
                 self.assertFalse(any(name.endswith("/mpv") or name.endswith("/python3") or "libvsscript" in name for name in names))
                 self.assertTrue(archive.getinfo(prefix + "MacOS/OpenSVPflow").external_attr >> 16 & 0o111)
+                worker_prefix = prefix + "Helpers/Open SVPflow Playback.app/Contents/"
+                worker_metadata = plistlib.loads(archive.read(worker_prefix + "Info.plist"))
+                self.assertIs(worker_metadata["LSBackgroundOnly"], True)
+                self.assertEqual(worker_metadata["CFBundleIdentifier"], "org.opensvpflow.mac.playback")
+                self.assertEqual(worker_metadata["CFBundlePackageType"], "APPL")
+                worker_executable = worker_prefix + "MacOS/" + worker_metadata["CFBundleExecutable"]
+                self.assertEqual(archive.read(worker_executable), b"native-playback-host")
+                self.assertTrue(archive.getinfo(worker_executable).external_attr >> 16 & 0o111)
                 metadata = plistlib.loads(archive.read(prefix + "Info.plist"))
                 self.assertEqual(metadata["CFBundleExecutable"], "OpenSVPflow")
                 self.assertEqual(metadata["CFBundleShortVersionString"], "11.0.0")

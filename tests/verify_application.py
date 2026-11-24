@@ -31,10 +31,17 @@ def verify(app):
             localized_info = plistlib.loads((localization / "InfoPlist.strings").read_bytes())
             assert localized_info["CFBundleShortVersionString"] == label, locale
     assert os.access(contents / "MacOS/OpenSVPflow", os.X_OK), "The extracted application executable lost its execute permission"
+    worker = contents / "Helpers/Open SVPflow Playback.app/Contents"
+    worker_metadata = plistlib.loads((worker / "Info.plist").read_bytes())
+    assert worker_metadata["LSBackgroundOnly"] is True
+    assert worker_metadata["CFBundleIdentifier"] == "org.opensvpflow.mac.playback"
+    assert worker_metadata["CFBundleVersion"] == metadata["CFBundleVersion"]
+    assert os.access(worker / "MacOS/PlaybackWorker", os.X_OK), "The playback controller lost its execute permission"
     assert not any(key.startswith("NS") and key.endswith("UsageDescription") for key in metadata)
     for name in ("README.md", "assets/OpenSVPflow-screenshot.png", "LICENSE", "THIRD_PARTY_NOTICES.md", "OpenSVPflow.icns", "StatusIconTemplate.png", "player/application.py", "player/settings_api.py", "player/session.py", "player/launch.py", "player/dependencies.py", "player/compat.lua", "player/graph.vpy"):
         assert (contents / "Resources" / name).is_file(), name
-    for relative in ("MacOS/OpenSVPflow", "Frameworks/libsvpflow1_vs.dylib", "Frameworks/libsvpflow2_vs.dylib"):
+    for relative in ("MacOS/OpenSVPflow", "Frameworks/libsvpflow1_vs.dylib", "Frameworks/libsvpflow2_vs.dylib",
+                     "Helpers/Open SVPflow Playback.app/Contents/MacOS/PlaybackWorker"):
         path = contents / relative
         arch, _ = command("/usr/bin/lipo", "-archs", str(path))
         assert arch.strip() == "arm64", (relative, arch)

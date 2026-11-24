@@ -25,6 +25,8 @@ PAYLOAD = (
 PLUGINS = ("libsvpflow1_vs.dylib", "libsvpflow2_vs.dylib")
 LOCALIZATIONS = ("en", "zh-Hans", "hi", "es", "ar", "fr", "bn", "pt-PT", "id", "ur", "ru", "de", "ja")
 APP_NAME = "Open SVPflow.app"
+WORKER_BUNDLE = "Helpers/Open SVPflow Playback.app/Contents"
+WORKER_EXECUTABLE = WORKER_BUNDLE + "/MacOS/PlaybackWorker"
 
 
 def validate_version(version):
@@ -32,7 +34,7 @@ def validate_version(version):
         raise ValueError("Invalid release version")
 
 
-def assemble_bundle(source, library, executable, icons, output, version):
+def assemble_bundle(source, library, executable, icons, output, version, *, worker):
     validate_version(version)
     files = [(Path(source) / name, "Resources/" + name) for name in PAYLOAD]
     files += [(Path(library) / name, "Frameworks/" + name) for name in PLUGINS]
@@ -42,7 +44,7 @@ def assemble_bundle(source, library, executable, icons, output, version):
         if directory.is_symlink():
             raise ValueError("Symlinked localization input: " + locale)
         files.append((directory / "Localizable.strings", "Resources/" + directory.name + "/Localizable.strings"))
-    files += [(Path(executable), "MacOS/OpenSVPflow")]
+    files += [(Path(executable), "MacOS/OpenSVPflow"), (Path(worker), WORKER_EXECUTABLE)]
     for path, name in files:
         if path.is_symlink():
             raise ValueError("Symlinked package input: " + name)
@@ -55,7 +57,7 @@ def assemble_bundle(source, library, executable, icons, output, version):
         destination = contents / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(origin, destination)
-        destination.chmod(0o755 if relative == "MacOS/OpenSVPflow" else 0o644)
+        destination.chmod(0o755 if relative in ("MacOS/OpenSVPflow", WORKER_EXECUTABLE) else 0o644)
     numbered_release = version.startswith("v")
     numeric = version[1:] + ".0.0" if numbered_release else version.split("-", 1)[0]
     build_version = version[1:] if numbered_release else numeric
@@ -88,6 +90,18 @@ def assemble_bundle(source, library, executable, icons, output, version):
         }],
     }
     (contents / "Info.plist").write_bytes(plistlib.dumps(metadata, sort_keys=True))
+    worker_metadata = {
+        "CFBundleIdentifier": "org.opensvpflow.mac.playback",
+        "CFBundleName": "Open SVPflow Playback",
+        "CFBundleExecutable": "PlaybackWorker",
+        "CFBundlePackageType": "APPL",
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleShortVersionString": numeric,
+        "CFBundleVersion": build_version,
+        "LSMinimumSystemVersion": "26.0",
+        "LSBackgroundOnly": True,
+    }
+    (contents / WORKER_BUNDLE / "Info.plist").write_bytes(plistlib.dumps(worker_metadata))
     return app
 
 
@@ -125,12 +139,13 @@ def main():
     parser.add_argument("--executable", type=Path)
     args = parser.parse_args()
     validate_version(args.version)
-    from build_app import build_executable, generate_icons, sign_bundle
+    from build_app import build_executable, build_worker, generate_icons, sign_bundle
     build = args.build_root / args.version
     build.mkdir(parents=True, exist_ok=False)
     executable = args.executable or build_executable(args.source, build / "swift")
     icons = generate_icons(args.source, build / "icons")
-    app = assemble_bundle(args.source, args.library, executable, icons, build / "bundle", args.version)
+    worker = build_worker(args.source, build / "PlaybackWorker")
+    app = assemble_bundle(args.source, args.library, executable, icons, build / "bundle", args.version, worker=worker)
     sign_bundle(app)
     print(archive_bundle(app, args.output, args.version))
 

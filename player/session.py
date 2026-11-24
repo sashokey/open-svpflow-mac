@@ -792,6 +792,19 @@ def serve(state_dir, bundle_root):
         ControlServer(state_dir, bundle_root).serve()
 
 
+def worker_command(state_dir, bundle_root):
+    command = [sys.executable, "-B", str(Path(__file__).with_name("application.py")), "serve",
+               "--state-dir", str(Path(state_dir).resolve()), "--bundle-root", str(Path(bundle_root).resolve())]
+    app = gui_bundle(bundle_root)
+    if sys.platform != "darwin" or app is None:
+        return command
+
+    worker = app / "Contents/Helpers/Open SVPflow Playback.app"
+    if not worker.is_dir():
+        raise RuntimeError("The application is missing its playback controller.")
+    return ["/usr/bin/open", "-n", "-g", "-j", "-W", "--stdin", "/dev/null", "-a", str(worker), "--args", *command]
+
+
 def open_files(state_dir, bundle_root, files, action="auto"):
     if action not in ("auto", "append", "replace", "cancel"):
         raise ValueError("Unsupported new-file action")
@@ -807,9 +820,10 @@ def open_files(state_dir, bundle_root, files, action="auto"):
         fcntl.flock(guard, fcntl.LOCK_EX)
         existing = connect_existing(state_dir)
         if existing is None:
+            command = worker_command(state_dir, bundle_root)
             log_descriptor = os.open(state_dir / "session.log", os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(log_descriptor, "wb") as output:
-                child = subprocess.Popen([sys.executable, "-B", str(Path(__file__).with_name("application.py")), "serve", "--state-dir", str(state_dir), "--bundle-root", str(bundle_root)], stdin=subprocess.DEVNULL, stdout=output, stderr=output, close_fds=True, start_new_session=True)
+                child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=output, close_fds=True, start_new_session=True)
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 existing = connect_existing(state_dir)
